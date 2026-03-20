@@ -30,6 +30,7 @@ dotenv.load_dotenv()
 OPENAI_ADMIN_KEY = os.environ.get("OPENAI_ADMIN_KEY", "")
 BOT_TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID          = os.environ.get("TELEGRAM_CHAT_ID", "")
+THREAD_ID        = int(os.environ["TELEGRAM_THREAD_ID"]) if os.environ.get("TELEGRAM_THREAD_ID") else None
 DAILY_LIMIT      = 5.00   # hardcoded — alerts fire at $5, then every $2 above
 POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL_MINS", "60")) * 60
 
@@ -488,9 +489,12 @@ class SubscriberStore:
 
 def _send(text: str, chat_id: str = None, thread_id: int = None) -> None:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id or CHAT_ID, "text": text, "parse_mode": "HTML"}
-    if thread_id:
-        payload["message_thread_id"] = thread_id
+    target_chat = chat_id or CHAT_ID
+    # Use configured THREAD_ID when sending to the primary chat and no thread override given
+    effective_thread = thread_id if thread_id is not None else (THREAD_ID if target_chat == CHAT_ID else None)
+    payload = {"chat_id": target_chat, "text": text, "parse_mode": "HTML"}
+    if effective_thread:
+        payload["message_thread_id"] = effective_thread
     try:
         r = requests.post(
             url,
@@ -1120,32 +1124,6 @@ def main() -> None:
     threading.Thread(target=telegram_poll_loop,    args=(usage, subs, bot_username), daemon=True).start()
     threading.Thread(target=usage_poll_loop,       args=(usage, subs),               daemon=True).start()
     threading.Thread(target=concurrency_check_loop,args=(usage, subs),               daemon=True).start()
-
-    # Startup message
-    snap  = usage.get()
-    hint  = f"<code>@{bot_username} help</code>" if bot_username else "mention me for commands"
-
-    if snap and snap.get("projects"):
-        total     = snap.get("total_cost", 0.0)
-        total_tok = sum(p.get("total_tokens", 0) for p in snap.get("projects", {}).values())
-        msg = (
-            f"<b>Bach the Monarch, I have returned to my post.</b>\n\n"
-            f"Last recorded — tokens: <b>{_fmt_tokens(total_tok)}</b>  "
-            f"spend: <b>${total:.4f}</b>  ({snap.get('date', '')})\n"
-            f"Polling every {POLL_INTERVAL // 60} min  •  Concurrency check every {CONCURRENCY_WINDOW_MINS} min\n"
-            f"Daily limit: ${DAILY_LIMIT:.2f}  •  Token cap: {_fmt_tokens(TOKEN_HARD_CAP)}\n\n"
-            f"<i>Use {hint} for commands.</i>"
-        )
-    else:
-        msg = (
-            f"<b>Bach the Monarch, I have assumed my post.</b>\n\n"
-            f"Watching {len(KNOWN_PROJECTS)} projects across your organization.\n"
-            f"Polling every {POLL_INTERVAL // 60} min  •  Concurrency check every {CONCURRENCY_WINDOW_MINS} min\n"
-            f"Daily limit: ${DAILY_LIMIT:.2f}  •  Token cap: {_fmt_tokens(TOKEN_HARD_CAP)}\n\n"
-            f"<i>Use {hint} for commands.</i>"
-        )
-
-    _send(msg)
 
     try:
         while True:
