@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Persistent bot state
+bot_data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Logs
+*.log
+logs/
