@@ -44,6 +44,7 @@ POLL_TIMEOUT     = 30  # Telegram long-poll
 
 # ── Token milestone config ──────────────────────────────────────────────────
 # (threshold, level)  level: "casual" | "urgent" | "cap"
+# Normal/mini models — 10M free daily (gpt-4o-mini, o1-mini, o3-mini, etc.)
 TOKEN_MILESTONES = [
     (1_000_000,  "casual"),
     (4_000_000,  "casual"),
@@ -54,6 +55,15 @@ TOKEN_MILESTONES = [
 ]
 TOKEN_HARD_CAP       = 10_000_000
 SPEND_ALERT_INTERVAL = 2.00        # alert every $2 of daily spend after cap
+
+# Premium models — 1M free daily (gpt-4o, gpt-4.1, o1, o3, etc.)
+PREMIUM_TOKEN_MILESTONES = [
+    (200_000,   "casual"),
+    (500_000,   "casual"),
+    (800_000,   "urgent"),
+    (1_000_000, "cap"),
+]
+PREMIUM_TOKEN_HARD_CAP = 1_000_000
 
 # ── Concurrent project detection ────────────────────────────────────────────
 CONCURRENCY_THRESHOLD   = 3    # alert if this many projects active simultaneously
@@ -69,10 +79,24 @@ KNOWN_PROJECTS: dict[str, str] = {
     "proj_fEboQnaVm4tQCk8kFy0h8s08": "khonlanh-project",
     "proj_zRWDq4YWIDEkxbgMAjX0xy79": "phongnguyen-project",  # RW, j, X
     "proj_J4rNEXilII2l889OotmE7YNW": "ngjabach-project",
+    "proj_OWrxxJaWk5MXHBi3HIdPxBDh": "oduong-project",
 }
 
 OPENAI_COSTS_URL = "https://api.openai.com/v1/organization/costs"
 OPENAI_USAGE_URL = "https://api.openai.com/v1/organization/usage/completions"
+
+
+# ── Model band classifier ──────────────────────────────────────────────────
+
+def _is_premium_model(model: str) -> bool:
+    """
+    Returns True if the model is in the 1M/day free-tier band (premium),
+    False if it's in the 10M/day band (mini/nano models).
+    Rule: any model containing 'mini' or 'nano' is in the normal (10M) band.
+    Everything else (full-size models) is in the premium (1M) band.
+    """
+    m = model.lower()
+    return "mini" not in m and "nano" not in m
 
 
 # ── Time helpers ───────────────────────────────────────────────────────────
@@ -113,35 +137,45 @@ def _openai_headers() -> dict:
 
 
 def _fetch_costs() -> dict[str, float]:
-    """Today's cost per project."""
+    """Today's cost per project. '__org__' key holds any unattributed org-level cost."""
     start, end = today_window()
     params = [
         ("start_time",   start),
         ("end_time",     end),
         ("bucket_width", "1d"),
         ("group_by[]",   "project_id"),
-        ("limit",        30),
+        ("limit",        100),
     ]
-    try:
-        r = requests.get(OPENAI_COSTS_URL, headers=_openai_headers(), params=params, timeout=REQUEST_TIMEOUT)
-    except Exception as e:
-        print(f"[openai costs network error] {e}")
-        return {}
-    if not r.ok:
-        print(f"[openai costs {r.status_code}] {r.text[:500]}")
-        return {}
     costs: dict[str, float] = {}
-    for bucket in r.json().get("data", []):
-        for result in bucket.get("results", []):
-            pid = result.get("project_id", "")
-            val = result.get("amount", {}).get("value", 0.0)
-            if pid:
+    page = None
+    while True:
+        p = list(params)
+        if page:
+            p.append(("page", page))
+        try:
+            r = requests.get(OPENAI_COSTS_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
+        except Exception as e:
+            print(f"[openai costs network error] {e}")
+            break
+        if not r.ok:
+            print(f"[openai costs {r.status_code}] {r.text[:500]}")
+            break
+        data = r.json()
+        for bucket in data.get("data", []):
+            for result in bucket.get("results", []):
+                pid = result.get("project_id") or "__org__"
+                val = float(result.get("amount", {}).get("value", 0.0))
                 costs[pid] = costs.get(pid, 0.0) + val
+        if not data.get("has_more"):
+            break
+        page = data.get("next_page")
+        if not page:
+            break
     return costs
 
 
 def _fetch_tokens() -> dict[str, dict]:
-    """Today's token usage per project, broken down by model."""
+    """Today's token usage per project, broken down by model and band."""
     start, end = today_window()
     params = [
         ("start_time",   start),
@@ -151,38 +185,57 @@ def _fetch_tokens() -> dict[str, dict]:
         ("group_by[]",   "model"),
         ("limit",        100),
     ]
-    try:
-        r = requests.get(OPENAI_USAGE_URL, headers=_openai_headers(), params=params, timeout=REQUEST_TIMEOUT)
-    except Exception as e:
-        print(f"[openai usage network error] {e}")
-        return {}
-    if not r.ok:
-        print(f"[openai usage {r.status_code}] {r.text[:500]}")
-        return {}
     tokens: dict[str, dict] = {}
-    for bucket in r.json().get("data", []):
-        for result in bucket.get("results", []):
-            pid   = result.get("project_id", "")
-            model = result.get("model", "unknown")
-            inp   = result.get("input_tokens", 0)
-            out   = result.get("output_tokens", 0)
-            reqs  = result.get("num_model_requests", 0)
-            if not pid:
-                continue
-            if pid not in tokens:
-                tokens[pid] = {"input_tokens": 0, "output_tokens": 0,
-                               "total_tokens": 0, "num_requests": 0, "models": {}}
-            tokens[pid]["input_tokens"]  += inp
-            tokens[pid]["output_tokens"] += out
-            tokens[pid]["total_tokens"]  += inp + out
-            tokens[pid]["num_requests"]  += reqs
-            m = tokens[pid]["models"].setdefault(model, {"input": 0, "output": 0, "requests": 0})
-            m["input"] += inp; m["output"] += out; m["requests"] += reqs
+    page = None
+    while True:
+        p = list(params)
+        if page:
+            p.append(("page", page))
+        try:
+            r = requests.get(OPENAI_USAGE_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
+        except Exception as e:
+            print(f"[openai usage network error] {e}")
+            break
+        if not r.ok:
+            print(f"[openai usage {r.status_code}] {r.text[:500]}")
+            break
+        data = r.json()
+        for bucket in data.get("data", []):
+            for result in bucket.get("results", []):
+                pid   = result.get("project_id", "")
+                model = result.get("model", "unknown")
+                inp   = result.get("input_tokens", 0)
+                out   = result.get("output_tokens", 0)
+                reqs  = result.get("num_model_requests", 0)
+                if not pid:
+                    continue
+                if pid not in tokens:
+                    tokens[pid] = {
+                        "input_tokens": 0, "output_tokens": 0,
+                        "total_tokens": 0, "num_requests": 0,
+                        "premium_tokens": 0, "normal_tokens": 0,
+                        "models": {},
+                    }
+                tokens[pid]["input_tokens"]  += inp
+                tokens[pid]["output_tokens"] += out
+                tokens[pid]["total_tokens"]  += inp + out
+                tokens[pid]["num_requests"]  += reqs
+                if _is_premium_model(model):
+                    tokens[pid]["premium_tokens"] += inp + out
+                else:
+                    tokens[pid]["normal_tokens"]  += inp + out
+                m = tokens[pid]["models"].setdefault(model, {"input": 0, "output": 0, "requests": 0})
+                m["input"] += inp; m["output"] += out; m["requests"] += reqs
+        if not data.get("has_more"):
+            break
+        page = data.get("next_page")
+        if not page:
+            break
     return tokens
 
 
 def _fetch_monthly_costs(year: int, month: int) -> dict[str, float]:
-    """Cost per project for a full calendar month."""
+    """Cost per project for a full calendar month. '__org__' key for unattributed costs."""
     start, end = month_window(year, month)
     params = [
         ("start_time",   start),
@@ -191,21 +244,31 @@ def _fetch_monthly_costs(year: int, month: int) -> dict[str, float]:
         ("group_by[]",   "project_id"),
         ("limit",        100),
     ]
-    try:
-        r = requests.get(OPENAI_COSTS_URL, headers=_openai_headers(), params=params, timeout=REQUEST_TIMEOUT)
-    except Exception as e:
-        print(f"[openai monthly costs error] {e}")
-        return {}
-    if not r.ok:
-        print(f"[openai monthly costs {r.status_code}] {r.text[:300]}")
-        return {}
     costs: dict[str, float] = {}
-    for bucket in r.json().get("data", []):
-        for result in bucket.get("results", []):
-            pid = result.get("project_id", "")
-            val = result.get("amount", {}).get("value", 0.0)
-            if pid:
+    page = None
+    while True:
+        p = list(params)
+        if page:
+            p.append(("page", page))
+        try:
+            r = requests.get(OPENAI_COSTS_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
+        except Exception as e:
+            print(f"[openai monthly costs error] {e}")
+            break
+        if not r.ok:
+            print(f"[openai monthly costs {r.status_code}] {r.text[:300]}")
+            break
+        data = r.json()
+        for bucket in data.get("data", []):
+            for result in bucket.get("results", []):
+                pid = result.get("project_id") or "__org__"
+                val = float(result.get("amount", {}).get("value", 0.0))
                 costs[pid] = costs.get(pid, 0.0) + val
+        if not data.get("has_more"):
+            break
+        page = data.get("next_page")
+        if not page:
+            break
     return costs
 
 
@@ -285,7 +348,7 @@ def _fetch_week_data() -> list[dict]:
                     continue
                 d = _day(ts)
                 for res in bucket.get("results", []):
-                    cost_by_day[d] = cost_by_day.get(d, 0.0) + res.get("amount", {}).get("value", 0.0)
+                    cost_by_day[d] = cost_by_day.get(d, 0.0) + float(res.get("amount", {}).get("value", 0.0))
         else:
             print(f"[week costs {r.status_code}] {r.text[:200]}")
     except Exception as e:
@@ -310,23 +373,32 @@ def fetch_today_usage() -> Optional[dict]:
     tokens = _fetch_tokens()
     if not costs and not tokens:
         return None
+    # Separate org-level unattributed cost from per-project costs
+    org_cost = costs.pop("__org__", 0.0)
     projects: dict[str, dict] = {}
     for pid in set(costs) | set(tokens):
         tok = tokens.get(pid, {})
         projects[pid] = {
-            "name":          KNOWN_PROJECTS.get(pid, pid),
-            "input_tokens":  tok.get("input_tokens", 0),
-            "output_tokens": tok.get("output_tokens", 0),
-            "total_tokens":  tok.get("total_tokens", 0),
-            "num_requests":  tok.get("num_requests", 0),
-            "cost_usd":      round(costs.get(pid, 0.0), 6),
-            "models":        tok.get("models", {}),
+            "name":           KNOWN_PROJECTS.get(pid, pid),
+            "input_tokens":   tok.get("input_tokens", 0),
+            "output_tokens":  tok.get("output_tokens", 0),
+            "total_tokens":   tok.get("total_tokens", 0),
+            "premium_tokens": tok.get("premium_tokens", 0),
+            "normal_tokens":  tok.get("normal_tokens", 0),
+            "num_requests":   tok.get("num_requests", 0),
+            "cost_usd":       round(costs.get(pid, 0.0), 6),
+            "models":         tok.get("models", {}),
         }
+    total_premium = sum(p["premium_tokens"] for p in projects.values())
+    total_normal  = sum(p["normal_tokens"]  for p in projects.values())
     return {
-        "date":        today_str(),
-        "projects":    projects,
-        "total_cost":  round(sum(costs.values()), 6),
-        "last_polled": time.time(),
+        "date":                 today_str(),
+        "projects":             projects,
+        "total_cost":           round(sum(costs.values()) + org_cost, 6),
+        "org_cost":             round(org_cost, 6),
+        "total_premium_tokens": total_premium,
+        "total_normal_tokens":  total_normal,
+        "last_polled":          time.time(),
     }
 
 
@@ -339,6 +411,7 @@ class UsageStore:
     _PRESERVED = (
         "alert_sent",
         "token_milestones_notified",
+        "premium_milestones_notified",
         "spend_intervals_notified",
         "last_concurrent_alert_ts",
         "active_projects",
@@ -375,9 +448,10 @@ class UsageStore:
     def reset_day(self):
         """Called at UTC midnight — resets all daily alert state."""
         with self._lock:
-            self._data["alert_sent"]                = False
-            self._data["token_milestones_notified"] = []
-            self._data["spend_intervals_notified"]  = 0
+            self._data["alert_sent"]                  = False
+            self._data["token_milestones_notified"]   = []
+            self._data["premium_milestones_notified"] = []
+            self._data["spend_intervals_notified"]    = 0
             self._save()
 
     def get(self) -> dict:
@@ -402,6 +476,18 @@ class UsageStore:
     def add_milestone_notified(self, threshold: int):
         with self._lock:
             ms = self._data.setdefault("token_milestones_notified", [])
+            if threshold not in ms:
+                ms.append(threshold)
+            self._save()
+
+    # Premium model milestones (1M band)
+    def get_premium_milestones_notified(self) -> set:
+        with self._lock:
+            return set(self._data.get("premium_milestones_notified", []))
+
+    def add_premium_milestone_notified(self, threshold: int):
+        with self._lock:
+            ms = self._data.setdefault("premium_milestones_notified", [])
             if threshold not in ms:
                 ms.append(threshold)
             self._save()
@@ -630,6 +716,32 @@ def fmt_token_milestone(threshold: int, current: int, level: str, name: str = "B
     )
 
 
+def fmt_premium_token_milestone(threshold: int, current: int, level: str, name: str = "Bach") -> str:
+    t = _fmt_tokens(threshold)
+    c = _fmt_tokens(current)
+    if level == "casual":
+        return (
+            f"📊 <b>Premium Token Threshold — {t}</b>\n\n"
+            f"Full-size model consumption stands at <b>{c} tokens</b>.\n"
+            f"Free tier: 1M/day (gpt-4o, gpt-4.1, o1, o3, etc.)\n"
+            f"<i>Monitoring continues, Monarch {name}.</i>"
+        )
+    if level == "urgent":
+        return (
+            f"⚠️ <b>Premium Model — High Usage — {t}</b>\n\n"
+            f"Full-size model usage has reached <b>{c} tokens</b>.\n"
+            f"Approaching the 1M daily free allowance for premium models.\n"
+            f"Your attention is advised, My Liege {name}."
+        )
+    # cap (1M)
+    return (
+        f"🚨 <b>Premium Free Allowance Exhausted — {c}</b>\n\n"
+        f"The {t}-token daily free tier for full-size models has been crossed.\n"
+        f"Premium models (gpt-4o, gpt-4.1, o1, o3, etc.) are now billing at standard rates.\n\n"
+        f"Monarch {name}, the operation requires your oversight."
+    )
+
+
 def fmt_limit_alert(total_cost: float, name: str = "Bach") -> str:
     return (
         f"⚠️ <b>Daily Spend Limit Reached — ${total_cost:.4f}</b>\n\n"
@@ -711,15 +823,22 @@ def fmt_daily_snapshot(snap: dict) -> str:
             )
             lines.append("")
 
+    total_premium = snap.get("total_premium_tokens", 0)
+    total_normal  = snap.get("total_normal_tokens",  0)
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"🔢 Tokens: <b>{_fmt_tokens(total_tok)}</b>   💰 Cost: <b>${total_cost:.4f}</b> / ${DAILY_LIMIT:.2f}")
+    lines.append(
+        f"🔢 Tokens: <b>{_fmt_tokens(total_tok)}</b>   💰 Cost: <b>${total_cost:.4f}</b> / ${DAILY_LIMIT:.2f}\n"
+        f"   ⭐ Premium (1M): <b>{_fmt_tokens(total_premium)}</b> / 1M"
+        f"   •   📦 Normal (10M): <b>{_fmt_tokens(total_normal)}</b> / 10M"
+    )
     return "\n".join(lines)
 
 
 # ── Milestone checker ──────────────────────────────────────────────────────
 
 def check_milestones(snap: dict, usage: UsageStore, subs: SubscriberStore, names: NameStore = None) -> None:
-    """Called after every poll. Fires token milestone alerts (informational only)."""
+    """Called after every poll. Fires token milestone alerts for both bands."""
+    # Normal band (10M free daily)
     total_tok = sum(p.get("total_tokens", 0) for p in snap.get("projects", {}).values())
     notified  = usage.get_milestones_notified()
     for threshold, level in TOKEN_MILESTONES:
@@ -729,6 +848,17 @@ def check_milestones(snap: dict, usage: UsageStore, subs: SubscriberStore, names
                 _broadcast_named(lambda n, t=threshold, c=total_tok, l=level: fmt_token_milestone(t, c, l, n), subs, names)
             else:
                 _send_all(fmt_token_milestone(threshold, total_tok, level), subs)
+
+    # Premium band (1M free daily)
+    total_premium    = snap.get("total_premium_tokens", 0)
+    notified_premium = usage.get_premium_milestones_notified()
+    for threshold, level in PREMIUM_TOKEN_MILESTONES:
+        if total_premium >= threshold and threshold not in notified_premium:
+            usage.add_premium_milestone_notified(threshold)
+            if names:
+                _broadcast_named(lambda n, t=threshold, c=total_premium, l=level: fmt_premium_token_milestone(t, c, l, n), subs, names)
+            else:
+                _send_all(fmt_premium_token_milestone(threshold, total_premium, level), subs)
 
 
 # ── Command handlers ───────────────────────────────────────────────────────
@@ -767,8 +897,14 @@ def cmd_tokens(usage: UsageStore, name: str = "Bach") -> str:
             lines.append(f"   <code>{model}</code>  {mi} in / {mo} out  ({mr:,} reqs)")
         lines.append("")
 
+    total_premium = snap.get("total_premium_tokens", 0)
+    total_normal  = snap.get("total_normal_tokens",  0)
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"🔢 Total: <b>{_fmt_tokens(total_tok)}</b>  •  {total_req:,} requests")
+    lines.append(
+        f"🔢 Total: <b>{_fmt_tokens(total_tok)}</b>  •  {total_req:,} requests\n"
+        f"   ⭐ Premium (1M): <b>{_fmt_tokens(total_premium)}</b> / 1M"
+        f"   •   📦 Normal (10M): <b>{_fmt_tokens(total_normal)}</b> / 10M"
+    )
     return "\n".join(lines)
 
 
@@ -811,8 +947,8 @@ def cmd_spending(name: str = "Bach") -> str:
         active = {pid: v for pid, v in costs.items() if v > 0.0}
         if active:
             for pid, cost in sorted(active.items(), key=lambda x: x[1], reverse=True):
-                name = KNOWN_PROJECTS.get(pid, pid)
-                lines.append(f"  • {name}: <b>${cost:.4f}</b>")
+                proj_label = "Unattributed" if pid == "__org__" else KNOWN_PROJECTS.get(pid, pid)
+                lines.append(f"  • {proj_label}: <b>${cost:.4f}</b>")
         else:
             lines.append("  No spend recorded.")
         lines.append(f"  Total: <b>${total:.4f}</b>\n")
@@ -879,14 +1015,22 @@ def cmd_refresh(usage: UsageStore, subs: SubscriberStore, name: str = "Bach") ->
     if snap:
         usage.update(snap)
         check_milestones(snap, usage, subs)
-        total     = snap.get("total_cost", 0.0)
-        total_tok = sum(p.get("total_tokens", 0) for p in snap.get("projects", {}).values())
-        return (
-            f"🔄 <b>Data refreshed.</b>\n"
-            f"Tokens today: <b>{_fmt_tokens(total_tok)}</b>\n"
-            f"Spend today:  <b>${total:.4f}</b>\n"
-            f"<i>Intelligence updated, Monarch {name}.</i>"
-        )
+        total         = snap.get("total_cost", 0.0)
+        total_tok     = sum(p.get("total_tokens", 0) for p in snap.get("projects", {}).values())
+        total_premium = snap.get("total_premium_tokens", 0)
+        total_normal  = snap.get("total_normal_tokens",  0)
+        total_other   = total_tok - total_premium - total_normal
+        lines = [
+            f"🔄 <b>Data refreshed.</b>",
+            f"Tokens today: <b>{_fmt_tokens(total_tok)}</b>",
+            f"   ⭐ Premium (1M):  <b>{_fmt_tokens(total_premium)}</b> / 1M",
+            f"   📦 Normal (10M): <b>{_fmt_tokens(total_normal)}</b> / 10M",
+        ]
+        if total_other > 0:
+            lines.append(f"   🔸 Other (billed): <b>{_fmt_tokens(total_other)}</b>")
+        lines.append(f"Spend today:  <b>${total:.4f}</b>")
+        lines.append(f"<i>Intelligence updated, Monarch {name}.</i>")
+        return "\n".join(lines)
     return f"Could not reach the OpenAI API. Will retry on schedule, My Liege {name}."
 
 
