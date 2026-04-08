@@ -56,6 +56,12 @@ TOKEN_MILESTONES = [
 TOKEN_HARD_CAP       = 10_000_000
 SPEND_ALERT_INTERVAL = 2.00        # alert every $2 of daily spend after cap
 
+# OpenAI costs API has a ~5-minute ingestion delay (documented).
+# We lag end_time by 10 minutes as a safe buffer. If fewer than
+# COST_DATA_DELAY_SECS have elapsed since midnight, costs are skipped
+# (no data would exist yet anyway).
+COST_DATA_DELAY_SECS = 600  # 10 minutes
+
 # Premium models — 1M free daily (gpt-4o, gpt-4.1, o1, o3, etc.)
 PREMIUM_TOKEN_MILESTONES = [
     (200_000,   "casual"),
@@ -85,6 +91,22 @@ KNOWN_PROJECTS: dict[str, str] = {
 OPENAI_COSTS_URL = "https://api.openai.com/v1/organization/costs"
 OPENAI_USAGE_URL = "https://api.openai.com/v1/organization/usage/completions"
 
+# ── Terminal colors (ANSI) ──────────────────────────────────────────────────
+_C_GREEN  = "\033[32m"
+_C_YELLOW = "\033[33m"
+_C_RED    = "\033[31m"
+_C_RESET  = "\033[0m"
+
+def _tok_color(tokens: int, hard_cap: int) -> str:
+    if tokens >= hard_cap:
+        return _C_RED
+    if tokens >= hard_cap * 0.7:   # top 30% before cap → yellow
+        return _C_YELLOW
+    return _C_GREEN
+
+def _color(text: str, code: str) -> str:
+    return f"{code}{text}{_C_RESET}"
+
 
 # ── Model band classifier ──────────────────────────────────────────────────
 
@@ -104,7 +126,21 @@ def _is_premium_model(model: str) -> bool:
 def today_window() -> tuple[int, int]:
     now   = datetime.now(timezone.utc)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    return int(start.timestamp()), int(now.timestamp())
+    end   = max(int(start.timestamp()) + 1, int(now.timestamp()))
+    return int(start.timestamp()), end
+
+
+def today_window_costs() -> tuple[int, int]:
+    """Window for today's costs query.
+    end_time is set to tomorrow's midnight so the daily bucket always spans a
+    full date range (the API compares dates, not timestamps — same-day start/end
+    triggers a 400 even when end_ts > start_ts). Future hours simply return no
+    data. The 10-minute ingestion lag is irrelevant here since we're not
+    using end_time to bound live data."""
+    now       = datetime.now(timezone.utc)
+    start     = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow  = start + timedelta(days=1)
+    return int(start.timestamp()), int(tomorrow.timestamp())
 
 
 def today_str() -> str:
@@ -138,7 +174,7 @@ def _openai_headers() -> dict:
 
 def _fetch_costs() -> dict[str, float]:
     """Today's cost per project. '__org__' key holds any unattributed org-level cost."""
-    start, end = today_window()
+    start, end = today_window_costs()
     params = [
         ("start_time",   start),
         ("end_time",     end),
@@ -369,15 +405,12 @@ def _fetch_week_data() -> list[dict]:
 
 
 def fetch_today_usage() -> Optional[dict]:
-    costs  = _fetch_costs()
+    """Tokens-only poll — no cost fetch (costs API is unreliable for frequent polling)."""
     tokens = _fetch_tokens()
-    if not costs and not tokens:
+    if not tokens:
         return None
-    # Separate org-level unattributed cost from per-project costs
-    org_cost = costs.pop("__org__", 0.0)
     projects: dict[str, dict] = {}
-    for pid in set(costs) | set(tokens):
-        tok = tokens.get(pid, {})
+    for pid, tok in tokens.items():
         projects[pid] = {
             "name":           KNOWN_PROJECTS.get(pid, pid),
             "input_tokens":   tok.get("input_tokens", 0),
@@ -386,7 +419,7 @@ def fetch_today_usage() -> Optional[dict]:
             "premium_tokens": tok.get("premium_tokens", 0),
             "normal_tokens":  tok.get("normal_tokens", 0),
             "num_requests":   tok.get("num_requests", 0),
-            "cost_usd":       round(costs.get(pid, 0.0), 6),
+            "cost_usd":       0.0,
             "models":         tok.get("models", {}),
         }
     total_premium = sum(p["premium_tokens"] for p in projects.values())
@@ -394,12 +427,26 @@ def fetch_today_usage() -> Optional[dict]:
     return {
         "date":                 today_str(),
         "projects":             projects,
-        "total_cost":           round(sum(costs.values()) + org_cost, 6),
-        "org_cost":             round(org_cost, 6),
+        "total_cost":           0.0,
         "total_premium_tokens": total_premium,
         "total_normal_tokens":  total_normal,
         "last_polled":          time.time(),
     }
+
+
+def _enrich_costs(snap: dict) -> dict:
+    """Fetch costs on-demand and overlay onto a snapshot copy. Used by bot commands."""
+    import copy
+    snap = copy.deepcopy(snap)
+    costs = _fetch_costs()
+    if not costs:
+        return snap
+    org_cost = costs.pop("__org__", 0.0)
+    for pid, p in snap.get("projects", {}).items():
+        p["cost_usd"] = round(costs.get(pid, 0.0), 6)
+    snap["total_cost"] = round(sum(costs.values()) + org_cost, 6)
+    snap["org_cost"]   = round(org_cost, 6)
+    return snap
 
 
 # ── Usage state store ──────────────────────────────────────────────────────
@@ -709,8 +756,8 @@ def fmt_token_milestone(threshold: int, current: int, level: str, name: str = "B
         )
     # cap (10M)
     return (
-        f"🚨 <b>Free Token Allowance Exhausted — {c}</b>\n\n"
-        f"The {t}-token daily free tier has been crossed.\n"
+        f"🚨 <b>Normal Models Allowance Exhausted — {c}</b>\n\n"
+        f"The {t}-token daily allowance for normal models has been crossed.\n"
         f"Mini models (gpt-4o-mini, o1-mini, o3-mini, etc.) are now billing at standard rates.\n\n"
         f"Monarch {name}, the operation requires your oversight."
     )
@@ -723,7 +770,7 @@ def fmt_premium_token_milestone(threshold: int, current: int, level: str, name: 
         return (
             f"📊 <b>Premium Token Threshold — {t}</b>\n\n"
             f"Full-size model consumption stands at <b>{c} tokens</b>.\n"
-            f"Free tier: 1M/day (gpt-4o, gpt-4.1, o1, o3, etc.)\n"
+            f"Premium models daily allowance: 1M/day (gpt-4o, gpt-4.1, o1, o3, etc.)\n"
             f"<i>Monitoring continues, Monarch {name}.</i>"
         )
     if level == "urgent":
@@ -736,7 +783,7 @@ def fmt_premium_token_milestone(threshold: int, current: int, level: str, name: 
     # cap (1M)
     return (
         f"🚨 <b>Premium Free Allowance Exhausted — {c}</b>\n\n"
-        f"The {t}-token daily free tier for full-size models has been crossed.\n"
+        f"The {t}-token daily allowance for premium models has been crossed.\n"
         f"Premium models (gpt-4o, gpt-4.1, o1, o3, etc.) are now billing at standard rates.\n\n"
         f"Monarch {name}, the operation requires your oversight."
     )
@@ -839,7 +886,7 @@ def fmt_daily_snapshot(snap: dict) -> str:
 def check_milestones(snap: dict, usage: UsageStore, subs: SubscriberStore, names: NameStore = None) -> None:
     """Called after every poll. Fires token milestone alerts for both bands."""
     # Normal band (10M free daily)
-    total_tok = sum(p.get("total_tokens", 0) for p in snap.get("projects", {}).values())
+    total_tok = snap.get("total_normal_tokens", 0)
     notified  = usage.get_milestones_notified()
     for threshold, level in TOKEN_MILESTONES:
         if total_tok >= threshold and threshold not in notified:
@@ -867,7 +914,7 @@ def cmd_today(usage: UsageStore, name: str = "Bach") -> str:
     snap = usage.get()
     if not snap or not snap.get("projects"):
         return f"No usage data on record, Monarch {name}."
-    return fmt_daily_snapshot(snap)
+    return fmt_daily_snapshot(_enrich_costs(snap))
 
 
 def cmd_tokens(usage: UsageStore, name: str = "Bach") -> str:
@@ -909,7 +956,7 @@ def cmd_tokens(usage: UsageStore, name: str = "Bach") -> str:
 
 
 def cmd_projects(usage: UsageStore, name: str = "Bach") -> str:
-    snap      = usage.get()
+    snap      = _enrich_costs(usage.get())
     projects  = snap.get("projects", {})
     if not projects:
         return f"No project data on record, Monarch {name}."
@@ -1015,21 +1062,19 @@ def cmd_refresh(usage: UsageStore, subs: SubscriberStore, name: str = "Bach") ->
     if snap:
         usage.update(snap)
         check_milestones(snap, usage, subs)
-        total         = snap.get("total_cost", 0.0)
+        enriched      = _enrich_costs(snap)
+        total         = enriched.get("total_cost", 0.0)
         total_tok     = sum(p.get("total_tokens", 0) for p in snap.get("projects", {}).values())
         total_premium = snap.get("total_premium_tokens", 0)
         total_normal  = snap.get("total_normal_tokens",  0)
-        total_other   = total_tok - total_premium - total_normal
         lines = [
             f"🔄 <b>Data refreshed.</b>",
             f"Tokens today: <b>{_fmt_tokens(total_tok)}</b>",
             f"   ⭐ Premium (1M):  <b>{_fmt_tokens(total_premium)}</b> / 1M",
             f"   📦 Normal (10M): <b>{_fmt_tokens(total_normal)}</b> / 10M",
+            f"Spend today:  <b>${total:.4f}</b>",
+            f"<i>Intelligence updated, Monarch {name}.</i>",
         ]
-        if total_other > 0:
-            lines.append(f"   🔸 Other (billed): <b>{_fmt_tokens(total_other)}</b>")
-        lines.append(f"Spend today:  <b>${total:.4f}</b>")
-        lines.append(f"<i>Intelligence updated, Monarch {name}.</i>")
         return "\n".join(lines)
     return f"Could not reach the OpenAI API. Will retry on schedule, My Liege {name}."
 
@@ -1250,31 +1295,13 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
             snap = fetch_today_usage()
             if snap:
                 usage.update(snap)
-                total     = snap.get("total_cost", 0.0)
-                total_tok = sum(p.get("total_tokens", 0) for p in snap.get("projects", {}).values())
-                print(f"[poll] {current_date}  tokens={_fmt_tokens(total_tok)}  cost=${total:.4f}")
+                normal_tok  = snap.get("total_normal_tokens", 0)
+                premium_tok = snap.get("total_premium_tokens", 0)
+                n_str = _color(f"{_fmt_tokens(normal_tok)}/10M",  _tok_color(normal_tok,  TOKEN_HARD_CAP))
+                p_str = _color(f"{_fmt_tokens(premium_tok)}/1M",  _tok_color(premium_tok, PREMIUM_TOKEN_HARD_CAP))
+                print(f"[poll] {current_date}  normal={n_str}  premium={p_str}")
 
                 check_milestones(snap, usage, subs, names)
-
-                # $5 limit alert — fires once
-                if total >= DAILY_LIMIT and not usage.get_alert_sent():
-                    usage.mark_alert_sent()
-                    if names:
-                        _broadcast_named(lambda n, t=total: fmt_limit_alert(t, n), subs, names)
-                    else:
-                        _send_all(fmt_limit_alert(total), subs)
-
-                # Post-limit: escalating drama every $2 above $5
-                if total > DAILY_LIMIT:
-                    intervals_above   = int((total - DAILY_LIMIT) / SPEND_ALERT_INTERVAL)
-                    intervals_notified = usage.get_spend_intervals_notified()
-                    if intervals_above > intervals_notified:
-                        usage.set_spend_intervals_notified(intervals_above)
-                        for lvl in range(intervals_notified + 1, intervals_above + 1):
-                            if names:
-                                _broadcast_named(lambda n, t=total, l=lvl: fmt_post_limit_alert(t, l, n), subs, names)
-                            else:
-                                _send_all(fmt_post_limit_alert(total, lvl), subs)
             else:
                 print("[poll] Could not fetch usage — will retry next interval")
 
