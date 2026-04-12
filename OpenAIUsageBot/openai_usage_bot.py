@@ -32,7 +32,7 @@ BOT_TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID          = os.environ.get("TELEGRAM_CHAT_ID", "")
 THREAD_ID        = int(os.environ["TELEGRAM_THREAD_ID"]) if os.environ.get("TELEGRAM_THREAD_ID") else None
 DAILY_LIMIT      = 5.00   # hardcoded — alerts fire at $5, then every $2 above
-POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL_MINS", "60")) * 60
+POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL_MINS", "5")) * 60
 
 BOT_DATA_DIR     = Path(__file__).parent / "bot_data"
 USAGE_STATE_PATH = BOT_DATA_DIR / "usage_state.json"
@@ -337,71 +337,92 @@ def _fetch_recent_activity(minutes: int = CONCURRENCY_WINDOW_MINS) -> dict[str, 
     return activity
 
 
-def _fetch_week_data() -> list[dict]:
-    """
-    Returns last 7 days as [{date, label, tokens, cost, today}], oldest first.
-    Makes two calls (costs + tokens) with daily buckets.
-    """
-    now   = datetime.now(timezone.utc)
-    start = (now - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
-    start_ts, end_ts = int(start.timestamp()), int(now.timestamp())
+def _fetch_recent_data(days: int = 31) -> dict:
+    """Aggregated data for the last `days` calendar days.
+    Returns per-project costs, org-level cost, total tokens, total requests."""
+    now      = datetime.now(timezone.utc)
+    start_dt = (now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    start_ts = int(start_dt.timestamp())
+    tok_end  = int(now.timestamp())
+    cost_end = int(tomorrow.timestamp())
 
-    def _day(ts: int) -> str:
-        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+    proj_costs:     dict[str, float] = {}
+    total_tokens   = 0
+    total_requests = 0
 
-    tok_by_day:  dict[str, int]   = {}
-    cost_by_day: dict[str, float] = {}
-
-    # Tokens
+    # Costs per project — paginated (API max limit=180 for costs endpoint)
+    cost_params = [
+        ("start_time",   start_ts),
+        ("end_time",     cost_end),
+        ("bucket_width", "1d"),
+        ("group_by[]",   "project_id"),
+        ("limit",        100),
+    ]
     try:
-        r = requests.get(OPENAI_USAGE_URL, headers=_openai_headers(), params=[
-            ("start_time", start_ts), ("end_time", end_ts),
-            ("bucket_width", "1d"), ("group_by[]", "project_id"), ("limit", 100),
-        ], timeout=REQUEST_TIMEOUT)
-        if r.ok:
-            for bucket in r.json().get("data", []):
-                ts = bucket.get("aggregation_timestamp", 0)
-                if not ts:
-                    continue
-                d = _day(ts)
-                for res in bucket.get("results", []):
-                    tok_by_day[d] = tok_by_day.get(d, 0) + res.get("input_tokens", 0) + res.get("output_tokens", 0)
-        else:
-            print(f"[week tokens {r.status_code}] {r.text[:200]}")
+        page = None
+        while True:
+            p = list(cost_params)
+            if page:
+                p.append(("page", page))
+            r = requests.get(OPENAI_COSTS_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
+            if r.ok:
+                data = r.json()
+                for bucket in data.get("data", []):
+                    for result in bucket.get("results", []):
+                        pid = result.get("project_id") or "__org__"
+                        val = float(result.get("amount", {}).get("value", 0.0))
+                        proj_costs[pid] = proj_costs.get(pid, 0.0) + val
+                if not data.get("has_more"):
+                    break
+                page = data.get("next_page")
+                if not page:
+                    break
+            else:
+                print(f"[recent costs {r.status_code}] {r.text[:200]}")
+                break
     except Exception as e:
-        print(f"[week tokens error] {e}")
+        print(f"[recent costs error] {e}")
 
-    # Costs
+    # Tokens + requests — paginated (API max limit=31 for bucket_width=1d)
+    tok_params = [
+        ("start_time",   start_ts),
+        ("end_time",     tok_end),
+        ("bucket_width", "1d"),
+        ("group_by[]",   "project_id"),
+        ("limit",        31),
+    ]
     try:
-        r = requests.get(OPENAI_COSTS_URL, headers=_openai_headers(), params=[
-            ("start_time", start_ts), ("end_time", end_ts),
-            ("bucket_width", "1d"), ("limit", 30),
-        ], timeout=REQUEST_TIMEOUT)
-        if r.ok:
-            for bucket in r.json().get("data", []):
-                ts = bucket.get("aggregation_timestamp", 0)
-                if not ts:
-                    continue
-                d = _day(ts)
-                for res in bucket.get("results", []):
-                    cost_by_day[d] = cost_by_day.get(d, 0.0) + float(res.get("amount", {}).get("value", 0.0))
-        else:
-            print(f"[week costs {r.status_code}] {r.text[:200]}")
+        page = None
+        while True:
+            p = list(tok_params)
+            if page:
+                p.append(("page", page))
+            r = requests.get(OPENAI_USAGE_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
+            if r.ok:
+                data = r.json()
+                for bucket in data.get("data", []):
+                    for result in bucket.get("results", []):
+                        total_tokens   += result.get("input_tokens", 0) + result.get("output_tokens", 0)
+                        total_requests += result.get("num_model_requests", 0)
+                if not data.get("has_more"):
+                    break
+                page = data.get("next_page")
+                if not page:
+                    break
+            else:
+                print(f"[recent tokens {r.status_code}] {r.text[:200]}")
+                break
     except Exception as e:
-        print(f"[week costs error] {e}")
+        print(f"[recent tokens error] {e}")
 
-    days = []
-    for i in range(6, -1, -1):
-        dt = now - timedelta(days=i)
-        d  = dt.strftime("%Y-%m-%d")
-        days.append({
-            "date":   d,
-            "label":  dt.strftime("%m/%d"),
-            "tokens": tok_by_day.get(d, 0),
-            "cost":   round(cost_by_day.get(d, 0.0), 4),
-            "today":  (i == 0),
-        })
-    return days
+    return {
+        "proj_costs":     proj_costs,
+        "total_tokens":   total_tokens,
+        "total_requests": total_requests,
+        "start_date":     start_dt.strftime("%Y-%m-%d"),
+        "end_date":       now.strftime("%Y-%m-%d"),
+    }
 
 
 def fetch_today_usage() -> Optional[dict]:
@@ -434,18 +455,30 @@ def fetch_today_usage() -> Optional[dict]:
     }
 
 
-def _enrich_costs(snap: dict) -> dict:
-    """Fetch costs on-demand and overlay onto a snapshot copy. Used by bot commands."""
+def _enrich_costs(snap: dict, usage: "UsageStore" = None, live: bool = True) -> dict:
+    """Overlay costs onto a snapshot copy.
+    Tries a live fetch first (when live=True). On success, writes to usage cache.
+    Falls back to cached costs from usage store if live fetch fails or live=False."""
     import copy
-    snap = copy.deepcopy(snap)
-    costs = _fetch_costs()
-    if not costs:
-        return snap
-    org_cost = costs.pop("__org__", 0.0)
-    for pid, p in snap.get("projects", {}).items():
-        p["cost_usd"] = round(costs.get(pid, 0.0), 6)
-    snap["total_cost"] = round(sum(costs.values()) + org_cost, 6)
-    snap["org_cost"]   = round(org_cost, 6)
+    snap  = copy.deepcopy(snap)
+    costs = _fetch_costs() if live else None
+    if costs:
+        org_cost = costs.pop("__org__", 0.0)
+        for pid, p in snap.get("projects", {}).items():
+            p["cost_usd"] = round(costs.get(pid, 0.0), 6)
+        snap["total_cost"] = round(sum(costs.values()) + org_cost, 6)
+        snap["org_cost"]   = round(org_cost, 6)
+        if usage:
+            usage.update_costs(costs, snap["total_cost"], org_cost)
+    else:
+        cached = usage.get_costs_cache() if usage else None
+        if cached:
+            per_proj = cached.get("per_project", {})
+            for pid, p in snap.get("projects", {}).items():
+                p["cost_usd"] = round(per_proj.get(pid, 0.0), 6)
+            snap["total_cost"] = cached.get("total", 0.0)
+            snap["costs_stale"] = True
+            snap["costs_ts"]    = cached.get("ts")
     return snap
 
 
@@ -463,6 +496,7 @@ class UsageStore:
         "last_concurrent_alert_ts",
         "active_projects",
         "active_window_mins",
+        "costs_cache",
     )
 
     def __init__(self, path: Path):
@@ -499,6 +533,7 @@ class UsageStore:
             self._data["token_milestones_notified"]   = []
             self._data["premium_milestones_notified"] = []
             self._data["spend_intervals_notified"]    = 0
+            self._data.pop("costs_cache", None)
             self._save()
 
     def get(self) -> dict:
@@ -573,6 +608,21 @@ class UsageStore:
     def get_active_window_mins(self) -> int:
         with self._lock:
             return self._data.get("active_window_mins", CONCURRENCY_WINDOW_MINS)
+
+    # Costs cache (per-project costs from last successful fetch)
+    def update_costs(self, per_project: dict, total: float, org: float) -> None:
+        with self._lock:
+            self._data["costs_cache"] = {
+                "per_project": dict(per_project),
+                "total":       total,
+                "org":         org,
+                "ts":          time.time(),
+            }
+            self._save()
+
+    def get_costs_cache(self) -> Optional[dict]:
+        with self._lock:
+            return self._data.get("costs_cache")
 
 
 # ── Subscriber store ───────────────────────────────────────────────────────
@@ -872,9 +922,10 @@ def fmt_daily_snapshot(snap: dict) -> str:
 
     total_premium = snap.get("total_premium_tokens", 0)
     total_normal  = snap.get("total_normal_tokens",  0)
+    cost_note     = f"  <i>(cost as of {_fmt_ts(snap.get('costs_ts'))})</i>" if snap.get("costs_stale") else ""
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append(
-        f"🔢 Tokens: <b>{_fmt_tokens(total_tok)}</b>   💰 Cost: <b>${total_cost:.4f}</b> / ${DAILY_LIMIT:.2f}\n"
+        f"🔢 Tokens: <b>{_fmt_tokens(total_tok)}</b>   💰 Cost: <b>${total_cost:.4f}</b> / ${DAILY_LIMIT:.2f}{cost_note}\n"
         f"   ⭐ Premium (1M): <b>{_fmt_tokens(total_premium)}</b> / 1M"
         f"   •   📦 Normal (10M): <b>{_fmt_tokens(total_normal)}</b> / 10M"
     )
@@ -909,13 +960,6 @@ def check_milestones(snap: dict, usage: UsageStore, subs: SubscriberStore, names
 
 
 # ── Command handlers ───────────────────────────────────────────────────────
-
-def cmd_today(usage: UsageStore, name: str = "Bach") -> str:
-    snap = usage.get()
-    if not snap or not snap.get("projects"):
-        return f"No usage data on record, Monarch {name}."
-    return fmt_daily_snapshot(_enrich_costs(snap))
-
 
 def cmd_tokens(usage: UsageStore, name: str = "Bach") -> str:
     snap    = usage.get()
@@ -956,7 +1000,7 @@ def cmd_tokens(usage: UsageStore, name: str = "Bach") -> str:
 
 
 def cmd_projects(usage: UsageStore, name: str = "Bach") -> str:
-    snap      = _enrich_costs(usage.get())
+    snap      = _enrich_costs(usage.get(), usage)
     projects  = snap.get("projects", {})
     if not projects:
         return f"No project data on record, Monarch {name}."
@@ -1062,44 +1106,66 @@ def cmd_refresh(usage: UsageStore, subs: SubscriberStore, name: str = "Bach") ->
     if snap:
         usage.update(snap)
         check_milestones(snap, usage, subs)
-        enriched      = _enrich_costs(snap)
+        enriched      = _enrich_costs(snap, usage)
         total         = enriched.get("total_cost", 0.0)
         total_tok     = sum(p.get("total_tokens", 0) for p in snap.get("projects", {}).values())
         total_premium = snap.get("total_premium_tokens", 0)
         total_normal  = snap.get("total_normal_tokens",  0)
+        stale_note    = f"  <i>(cost as of {_fmt_ts(enriched.get('costs_ts'))})</i>" if enriched.get("costs_stale") else ""
         lines = [
             f"🔄 <b>Data refreshed.</b>",
             f"Tokens today: <b>{_fmt_tokens(total_tok)}</b>",
             f"   ⭐ Premium (1M):  <b>{_fmt_tokens(total_premium)}</b> / 1M",
             f"   📦 Normal (10M): <b>{_fmt_tokens(total_normal)}</b> / 10M",
-            f"Spend today:  <b>${total:.4f}</b>",
+            f"Spend today:  <b>${total:.4f}</b>{stale_note}",
             f"<i>Intelligence updated, Monarch {name}.</i>",
         ]
         return "\n".join(lines)
-    return f"Could not reach the OpenAI API. Will retry on schedule, My Liege {name}."
+    # Token fetch failed — return last cached snapshot
+    cached = usage.get()
+    if cached and cached.get("projects"):
+        enriched = _enrich_costs(cached, usage, live=False)
+        return (
+            f"⚠️ <b>OpenAI API unreachable — showing last known data.</b>\n\n"
+            + fmt_daily_snapshot(enriched)
+        )
+    return f"OpenAI API unreachable and no prior data on record, Monarch {name}."
 
 
-def cmd_week(name: str = "Bach") -> str:
-    days = _fetch_week_data()
-    if not any(d["tokens"] or d["cost"] for d in days):
-        return f"No weekly data available from the API, Monarch {name}."
+def cmd_recent(name: str = "Bach") -> str:
+    data           = _fetch_recent_data(31)
+    proj_costs     = data.get("proj_costs", {})
+    total_tokens   = data.get("total_tokens", 0)
+    total_requests = data.get("total_requests", 0)
+    start_date     = data.get("start_date", "")
+    end_date       = data.get("end_date", "")
 
-    max_tok = max((d["tokens"] for d in days), default=1) or 1
-    lines   = ["📅 <b>7-Day Rolling Trend</b>\n<code>"]
+    org_cost   = proj_costs.pop("__org__", 0.0)
+    total_cost = round(sum(proj_costs.values()) + org_cost, 4)
 
-    for d in days:
-        bar_w  = int(d["tokens"] / max_tok * 8)
-        bar    = "█" * bar_w + "░" * (8 - bar_w)
-        marker = " ◄ today" if d["today"] else ""
-        tok    = _fmt_tokens(d["tokens"]).rjust(6)
-        cost   = f"${d['cost']:.3f}".rjust(7)
-        lines.append(f"{d['label']} [{bar}] {tok}  {cost}{marker}")
+    if not proj_costs and not total_tokens:
+        return f"No usage recorded in the last 31 days, Monarch {name}."
 
-    lines.append("</code>")
-    total_tok  = sum(d["tokens"] for d in days)
-    total_cost = sum(d["cost"]   for d in days)
-    lines.append(f"7-day total: <b>{_fmt_tokens(total_tok)}</b> tokens  •  <b>${total_cost:.4f}</b>")
-    lines.append(f"\n<i>Monarch {name}, the weekly record is presented.</i>")
+    lines = [f"📊 <b>Usage — Last 31 Days</b>  <i>({start_date} → {end_date})</i>\n"]
+
+    active = {pid: v for pid, v in proj_costs.items() if v > 0.0}
+    if active:
+        for pid, cost in sorted(active.items(), key=lambda x: x[1], reverse=True):
+            label = KNOWN_PROJECTS.get(pid, pid)
+            lines.append(f"🔹 <b>{label}</b>   ${cost:.4f}")
+        if org_cost > 0.0:
+            lines.append(f"🔹 <b>Unattributed</b>   ${org_cost:.4f}")
+        lines.append("")
+    else:
+        lines.append("No spend recorded in this period.\n")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(
+        f"🔢 Tokens: <b>{_fmt_tokens(total_tokens)}</b>   "
+        f"📨 Requests: <b>{total_requests:,}</b>   "
+        f"💰 Cost: <b>${total_cost:.4f}</b>"
+    )
+    lines.append(f"\n<i>Monarch {name}, the 31-day record is presented.</i>")
     return "\n".join(lines)
 
 
@@ -1179,14 +1245,13 @@ def cmd_help(bot_username: Optional[str], name: str = "Bach") -> str:
         f"📋 <b>Shadow Ledger — Command Registry</b>\n"
         f"Trigger: <code>{m} &lt;command&gt;</code>\n\n"
         f"<b>Daily Usage</b>\n"
-        f"<code>{m} today</code>      — Full token &amp; cost report\n"
+        f"<code>{m} refresh</code>    — Force poll; shows last known data if API fails\n"
         f"<code>{m} tokens</code>     — Per-project breakdown by model\n"
         f"<code>{m} models</code>     — Aggregate model usage across all projects\n"
         f"<code>{m} projects</code>   — Project roster with token bar chart\n"
-        f"<code>{m} rank</code>       — Rankings by token use and spend\n"
-        f"<code>{m} refresh</code>    — Force immediate poll\n\n"
+        f"<code>{m} rank</code>       — Rankings by token use and spend\n\n"
         f"<b>Trends &amp; Spending</b>\n"
-        f"<code>{m} week</code>       — 7-day rolling token &amp; spend trend\n"
+        f"<code>{m} recent</code>     — Last 31 days: per-project cost, total tokens &amp; requests\n"
         f"<code>{m} spending</code>   — Monthly bill (current + previous month)\n\n"
         f"<b>Concurrency</b>\n"
         f"<code>{m} active</code>     — Projects active in last {CONCURRENCY_WINDOW_MINS} min\n\n"
@@ -1227,12 +1292,11 @@ def dispatch(text: str, usage: UsageStore, subs: SubscriberStore,
         return cmd_setname(chat_id, new_name, names) if names else "Name store unavailable."
 
     routes = {
-        "today":    lambda: cmd_today(usage, name),
         "tokens":   lambda: cmd_tokens(usage, name),
         "projects": lambda: cmd_projects(usage, name),
         "rank":     lambda: cmd_rank(usage, name),
         "spending": lambda: cmd_spending(name),
-        "week":     lambda: cmd_week(name),
+        "recent":   lambda: cmd_recent(name),
         "models":   lambda: cmd_models(usage, name),
         "active":   lambda: cmd_active(usage, name),
         "refresh":  lambda: cmd_refresh(usage, subs, name),
@@ -1290,6 +1354,8 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
         usage.reset_day()
         print(f"[poll] Stale state from {persisted_date} — daily state reset on startup")
 
+    fail_count = 0
+
     while True:
         try:
             current_date = today_str()
@@ -1300,19 +1366,42 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
 
             snap = fetch_today_usage()
             if snap:
+                # Fetch costs and overlay onto snapshot; fall back to cache on failure
+                costs = _fetch_costs()
+                if costs:
+                    org_cost = costs.pop("__org__", 0.0)
+                    for pid, p in snap.get("projects", {}).items():
+                        p["cost_usd"] = round(costs.get(pid, 0.0), 6)
+                    snap["total_cost"] = round(sum(costs.values()) + org_cost, 6)
+                    usage.update_costs(costs, snap["total_cost"], org_cost)
+                else:
+                    cached_costs = usage.get_costs_cache()
+                    if cached_costs:
+                        per_proj = cached_costs.get("per_project", {})
+                        for pid, p in snap.get("projects", {}).items():
+                            p["cost_usd"] = round(per_proj.get(pid, 0.0), 6)
+                        snap["total_cost"] = cached_costs.get("total", 0.0)
+
                 usage.update(snap)
                 normal_tok  = snap.get("total_normal_tokens", 0)
                 premium_tok = snap.get("total_premium_tokens", 0)
-                n_str = _color(f"{_fmt_tokens(normal_tok)}/10M",  _tok_color(normal_tok,  TOKEN_HARD_CAP))
-                p_str = _color(f"{_fmt_tokens(premium_tok)}/1M",  _tok_color(premium_tok, PREMIUM_TOKEN_HARD_CAP))
-                print(f"[poll] {current_date}  normal={n_str}  premium={p_str}")
+                n_str    = _color(f"{_fmt_tokens(normal_tok)}/10M",  _tok_color(normal_tok,  TOKEN_HARD_CAP))
+                p_str    = _color(f"{_fmt_tokens(premium_tok)}/1M",  _tok_color(premium_tok, PREMIUM_TOKEN_HARD_CAP))
+                cost_str = f"  cost=${snap.get('total_cost', 0.0):.4f}" if snap.get("total_cost") else ""
+                print(f"[poll] {current_date}  normal={n_str}  premium={p_str}{cost_str}")
 
                 check_milestones(snap, usage, subs, names)
+                fail_count = 0
             else:
-                print("[poll] Could not fetch usage — will retry next interval")
+                fail_count += 1
+                wait = min(POLL_INTERVAL * (2 ** min(fail_count - 1, 4)), 1800)
+                print(f"[poll] Fetch failed ({fail_count}) — retry in {wait // 60:.0f}min")
+                time.sleep(wait)
+                continue
 
         except Exception as e:
             print(f"[poll loop error] {e}")
+            fail_count += 1
 
         time.sleep(POLL_INTERVAL)
 
