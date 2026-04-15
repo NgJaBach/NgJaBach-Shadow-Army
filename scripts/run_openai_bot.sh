@@ -20,16 +20,17 @@ cd "$REPO_ROOT"
 # ── 1. Virtual environment ────────────────────────────────────
 if [ ! -d "$VENV_DIR" ]; then
     echo "[setup] Creating virtual environment at .venv ..."
-    python3 -m venv "$VENV_DIR" 2>/dev/null || true
+    python3 -m venv "$VENV_DIR" 2>/dev/null || python -m venv "$VENV_DIR"
 fi
 
-# Activate if pip is available inside the venv (python3.12-venv required)
+# Activate if pip is available inside the venv
+# Linux: bin/pip  |  Windows (Git Bash): Scripts/pip.exe
 VENV_PIP=""
 if [ -f "$VENV_DIR/bin/pip" ]; then
     VENV_PIP="$VENV_DIR/bin/pip"
     source "$VENV_DIR/bin/activate"
     PYTHON="$VENV_DIR/bin/python3"
-elif [ -f "$VENV_DIR/Scripts/pip" ]; then
+elif [ -f "$VENV_DIR/Scripts/pip.exe" ] || [ -f "$VENV_DIR/Scripts/pip" ]; then
     VENV_PIP="$VENV_DIR/Scripts/pip"
     source "$VENV_DIR/Scripts/activate"
     PYTHON="$VENV_DIR/Scripts/python"
@@ -40,10 +41,11 @@ echo "[setup] Installing / verifying dependencies ..."
 if [ -n "$VENV_PIP" ]; then
     "$VENV_PIP" install -q --upgrade requests python-dotenv
 else
-    # Fallback: install into user environment (venv had no pip)
+    # Fallback: install into system/user Python (pip3 on Linux, pip on Windows)
     echo "[setup] venv has no pip — installing to user environment ..."
-    pip3 install -q --break-system-packages --upgrade requests python-dotenv \
-        2>/dev/null || pip3 install -q --upgrade requests python-dotenv
+    PIP_CMD="$(command -v pip3 2>/dev/null || command -v pip)"
+    "$PIP_CMD" install -q --break-system-packages --upgrade requests python-dotenv \
+        2>/dev/null || "$PIP_CMD" install -q --upgrade requests python-dotenv
 fi
 
 # ── 3. Env check ─────────────────────────────────────────────
