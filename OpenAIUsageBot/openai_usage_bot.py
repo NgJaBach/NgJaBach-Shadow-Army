@@ -30,7 +30,6 @@ dotenv.load_dotenv()
 OPENAI_ADMIN_KEY = os.environ.get("OPENAI_ADMIN_KEY", "")
 BOT_TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID          = os.environ.get("TELEGRAM_CHAT_ID", "")
-THREAD_ID        = int(os.environ["TELEGRAM_THREAD_ID"]) if os.environ.get("TELEGRAM_THREAD_ID") else None
 DAILY_LIMIT      = 5.00   # hardcoded — alerts fire at $5, then every $2 above
 POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL_MINS", "5")) * 60
 
@@ -705,14 +704,30 @@ class NameStore:
 
 # ── Telegram I/O ───────────────────────────────────────────────────────────
 
+GIF_DIR = Path(__file__).parent / "gifs"
+
+
+def _send_animation(path: Path, chat_id: str = None, thread_id: int = None) -> None:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendAnimation"
+    target_chat = chat_id or CHAT_ID
+    data = {"chat_id": target_chat}
+    if thread_id:
+        data["message_thread_id"] = str(thread_id)
+    try:
+        with path.open("rb") as f:
+            r = requests.post(url, data=data, files={"animation": f}, timeout=30)
+        if not r.ok:
+            print(f"[telegram anim {r.status_code}] chat={target_chat} | {r.text[:400]}")
+    except Exception as e:
+        print(f"[telegram anim error] {e}")
+
+
 def _send(text: str, chat_id: str = None, thread_id: int = None) -> None:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     target_chat = chat_id or CHAT_ID
-    # Use configured THREAD_ID when sending to the primary chat and no thread override given
-    effective_thread = thread_id if thread_id is not None else (THREAD_ID if target_chat == CHAT_ID else None)
     payload = {"chat_id": target_chat, "text": text, "parse_mode": "HTML"}
-    if effective_thread:
-        payload["message_thread_id"] = effective_thread
+    if thread_id:
+        payload["message_thread_id"] = thread_id
     try:
         r = requests.post(
             url,
@@ -1201,7 +1216,10 @@ def cmd_models(usage: UsageStore, name: str = "Bach") -> str:
     return "\n".join(lines)
 
 
-def cmd_arise(chat_id: str, subs: SubscriberStore, name: str = "Bach") -> str:
+def cmd_arise(chat_id: str, subs: SubscriberStore, name: str = "Bach", thread_id: int = None) -> str:
+    gif = GIF_DIR / "beru-v-jinwoo.gif"
+    if gif.exists():
+        _send_animation(gif, chat_id, thread_id)
     added = subs.add(chat_id)
     if added:
         return (
@@ -1278,7 +1296,8 @@ def _match_prefix(text: str, bot_username: Optional[str]) -> Optional[str]:
 
 
 def dispatch(text: str, usage: UsageStore, subs: SubscriberStore,
-             bot_username: Optional[str], chat_id: str, names: NameStore = None) -> Optional[str]:
+             bot_username: Optional[str], chat_id: str, names: NameStore = None,
+             thread_id: int = None) -> Optional[str]:
     rest = _match_prefix(text, bot_username)
     if rest is None:
         return None
@@ -1301,7 +1320,7 @@ def dispatch(text: str, usage: UsageStore, subs: SubscriberStore,
         "models":   lambda: cmd_models(usage, name),
         "active":   lambda: cmd_active(usage, name),
         "refresh":  lambda: cmd_refresh(usage, subs, name),
-        "arise":    lambda: cmd_arise(chat_id, subs, name),
+        "arise":    lambda: cmd_arise(chat_id, subs, name, thread_id),
         "dismiss":  lambda: cmd_dismiss(chat_id, subs, name),
         "help":     lambda: cmd_help(bot_username, name),
     }
@@ -1338,7 +1357,7 @@ def telegram_poll_loop(usage: UsageStore, subs: SubscriberStore,
                 cmd = rest.split()[0].lower() if rest.split() else "help"
                 if cmd != "arise" and chat_id not in subs.all():
                     continue  # not subscribed — ignore all commands except arise
-                reply = dispatch(text, usage, subs, bot_username, chat_id, names)
+                reply = dispatch(text, usage, subs, bot_username, chat_id, names, thread_id)
                 if reply:
                     _send(reply, chat_id, thread_id)
             except Exception as e:
