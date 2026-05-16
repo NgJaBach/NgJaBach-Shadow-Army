@@ -31,7 +31,20 @@ OPENAI_ADMIN_KEY = os.environ.get("OPENAI_ADMIN_KEY", "")
 BOT_TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID          = os.environ.get("TELEGRAM_CHAT_ID", "")
 DAILY_LIMIT      = 5.00   # hardcoded — alerts fire at $5, then every $2 above
-POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL_MINS", "5")) * 60
+# ── Polling intervals ───────────────────────────────────────────────────────
+# Passive mode: long polling, exponential backoff on consecutive failures.
+# POLL_INTERVAL_MINS env var sets the passive baseline (default 30 min).
+PASSIVE_INTERVAL_SECS = int(os.environ.get("POLL_INTERVAL_MINS", "30")) * 60
+PASSIVE_BACKOFF_MAX   = 2 * 3600   # 2-hour ceiling during failure backoff
+
+# Urgent / aggressive mode: short polling after a milestone or cap breach.
+URGENT_INTERVAL_MIN  = 3 * 60     # 3-minute floor
+URGENT_INTERVAL_MAX  = 10 * 60    # 10-minute ceiling
+URGENT_INTERVAL_STEP = 60         # +1 min per poll until ceiling is reached
+
+# Revert timers
+URGENT_REVERT_SECS     = 3600     # 1 h without new milestone  → back to passive
+AGGRESSIVE_REVERT_SECS = 3600     # 1 h since last illegal project → back to passive
 
 BOT_DATA_DIR     = Path(__file__).parent / "bot_data"
 USAGE_STATE_PATH = BOT_DATA_DIR / "usage_state.json"
@@ -74,6 +87,12 @@ PREMIUM_TOKEN_HARD_CAP = 1_000_000
 CONCURRENCY_THRESHOLD   = 3    # alert if this many projects active simultaneously
 CONCURRENCY_WINDOW_MINS = 5    # "active" = had requests within last N minutes
 CONCURRENCY_COOLDOWN    = 900  # seconds between concurrency alerts (15 min)
+
+# ── Overcap detection window ─────────────────────────────────────────────────
+# OpenAI usage API has a 5–15 min ingestion lag. The concurrency window (5 min)
+# is too narrow — by the time data appears, the activity is already outside it.
+# Use a wider window for overcap checks so recent-but-delayed data is caught.
+OVERCAP_WINDOW_MINS = 20
 
 # ── Known projects (IDs from exported CSV — case-sensitive) ─────────────────
 KNOWN_PROJECTS: dict[str, str] = {
@@ -500,6 +519,13 @@ class UsageStore:
         "active_projects",
         "active_window_mins",
         "costs_cache",
+        # mode management — must survive snapshot updates
+        "bot_mode",
+        "mode_entered_ts",
+        "last_milestone_ts",
+        "last_illegal_seen_ts",
+        "urgent_poll_step",
+        "milestones_seeded",
     )
 
     def __init__(self, path: Path):
@@ -530,12 +556,18 @@ class UsageStore:
             self._save()
 
     def reset_day(self):
-        """Called at UTC midnight — resets all daily alert state."""
+        """Called at UTC midnight — resets all daily alert and mode state."""
         with self._lock:
             self._data["alert_sent"]                  = False
             self._data["token_milestones_notified"]   = []
             self._data["premium_milestones_notified"] = []
             self._data["spend_intervals_notified"]    = 0
+            self._data["bot_mode"]                    = "passive"
+            self._data["mode_entered_ts"]             = None
+            self._data["last_milestone_ts"]           = None
+            self._data["last_illegal_seen_ts"]        = None
+            self._data["urgent_poll_step"]            = 0
+            self._data["milestones_seeded"]           = False
             self._data.pop("costs_cache", None)
             self._save()
 
@@ -626,6 +658,69 @@ class UsageStore:
     def get_costs_cache(self) -> Optional[dict]:
         with self._lock:
             return self._data.get("costs_cache")
+
+    # ── Polling mode management ────────────────────────────────────────────────
+    # Modes: "passive" | "urgent" | "aggressive"
+
+    def get_mode(self) -> str:
+        with self._lock:
+            return self._data.get("bot_mode", "passive")
+
+    def set_mode(self, mode: str) -> None:
+        """Switch mode. Entering urgent/aggressive resets the poll step to floor."""
+        with self._lock:
+            self._data["bot_mode"]        = mode
+            self._data["mode_entered_ts"] = time.time()
+            if mode in ("urgent", "aggressive"):
+                self._data["urgent_poll_step"] = 0
+            self._save()
+
+    def reset_urgent_step(self) -> None:
+        """Restart urgent interval back to floor without changing mode."""
+        with self._lock:
+            self._data["urgent_poll_step"] = 0
+            self._save()
+
+    def get_urgent_interval(self) -> int:
+        """Current sleep duration (seconds) for urgent/aggressive mode."""
+        with self._lock:
+            step = self._data.get("urgent_poll_step", 0)
+            return min(URGENT_INTERVAL_MIN + step * URGENT_INTERVAL_STEP, URGENT_INTERVAL_MAX)
+
+    def increment_urgent_step(self) -> None:
+        with self._lock:
+            max_step = (URGENT_INTERVAL_MAX - URGENT_INTERVAL_MIN) // URGENT_INTERVAL_STEP
+            step = self._data.get("urgent_poll_step", 0)
+            self._data["urgent_poll_step"] = min(step + 1, max_step)
+            self._save()
+
+    def get_last_milestone_ts(self) -> Optional[float]:
+        with self._lock:
+            return self._data.get("last_milestone_ts")
+
+    def set_last_milestone_ts(self, ts: float) -> None:
+        with self._lock:
+            self._data["last_milestone_ts"] = ts
+            self._save()
+
+    def get_last_illegal_seen_ts(self) -> Optional[float]:
+        with self._lock:
+            return self._data.get("last_illegal_seen_ts")
+
+    def update_last_illegal_seen(self) -> None:
+        with self._lock:
+            self._data["last_illegal_seen_ts"] = time.time()
+            self._save()
+
+    def has_seeded(self) -> bool:
+        """True once seed_milestones() has run for today — guards cmd_refresh race."""
+        with self._lock:
+            return self._data.get("milestones_seeded", False)
+
+    def mark_seeded(self) -> None:
+        with self._lock:
+            self._data["milestones_seeded"] = True
+            self._save()
 
 
 # ── Subscriber store ───────────────────────────────────────────────────────
@@ -910,6 +1005,59 @@ def fmt_concurrency_alert(active: dict, name: str = "Bach") -> str:
     return "\n".join(lines)
 
 
+def fmt_overcap_active_alert(active: dict, normal_exceeded: bool, premium_exceeded: bool, name: str = "Bach") -> str:
+    bands = []
+    if normal_exceeded:
+        bands.append("Normal (10M)")
+    if premium_exceeded:
+        bands.append("Premium (1M)")
+    band_str = " & ".join(bands)
+
+    lines = [
+        f"🔴 <b>‼️ BUDGET BREACHED — ILLEGAL ACTIVITY DETECTED ‼️</b>\n",
+        f"The <b>{band_str}</b> free-tier allowance is <b>exhausted</b>.",
+        f"These projects are <b>still running</b> — every request now burns real funds:\n",
+    ]
+    for pid, count in sorted(active.items(), key=lambda x: x[1], reverse=True):
+        proj_name = KNOWN_PROJECTS.get(pid, pid)
+        lines.append(f"🚨 <b>{proj_name}</b>  —  {count:,} requests in the last {CONCURRENCY_WINDOW_MINS} min")
+    lines.append(f"\n<b>HALT ALL NON-ESSENTIAL OPERATIONS IMMEDIATELY.</b>")
+    lines.append(f"<i>(Activity window: last {OVERCAP_WINDOW_MINS} min — accounts for API ingestion lag)</i>")
+    lines.append(f"<i>Monarch {name} — the treasury is bleeding. Your command is required at once.</i>")
+    return "\n".join(lines)
+
+
+# ── Overcap handler ────────────────────────────────────────────────────────
+
+def _handle_overcap(snap: dict, usage: UsageStore, subs: SubscriberStore,
+                    names: NameStore, normal_exceeded: bool, premium_exceeded: bool) -> None:
+    """Fetch recent activity. If any projects are active, enter aggressive mode and broadcast.
+    Uses OVERCAP_WINDOW_MINS (wider than concurrency window) to account for the 5–15 min
+    OpenAI ingestion lag. If quiet for AGGRESSIVE_REVERT_SECS, revert to passive."""
+    activity = _fetch_recent_activity(minutes=OVERCAP_WINDOW_MINS)
+    active   = {pid: c for pid, c in activity.items() if c > 0}
+    mode     = usage.get_mode()
+
+    if active:
+        usage.update_last_illegal_seen()
+        if mode != "aggressive":
+            usage.set_mode("aggressive")
+            print(f"[mode] → AGGRESSIVE ({len(active)} illegal project(s) active)")
+        if names:
+            _broadcast_named(
+                lambda n, a=active, ne=normal_exceeded, pe=premium_exceeded:
+                    fmt_overcap_active_alert(a, ne, pe, n),
+                subs, names,
+            )
+        else:
+            _send_all(fmt_overcap_active_alert(active, normal_exceeded, premium_exceeded), subs)
+    elif mode == "aggressive":
+        last_ts = usage.get_last_illegal_seen_ts()
+        if last_ts and time.time() - last_ts > AGGRESSIVE_REVERT_SECS:
+            usage.set_mode("passive")
+            print("[mode] → PASSIVE (1 h since last illegal project — standing down)")
+
+
 # ── Formatters — command responses ─────────────────────────────────────────
 
 def fmt_daily_snapshot(snap: dict) -> str:
@@ -953,13 +1101,68 @@ def fmt_daily_snapshot(snap: dict) -> str:
 
 # ── Milestone checker ──────────────────────────────────────────────────────
 
-def check_milestones(snap: dict, usage: UsageStore, subs: SubscriberStore, names: NameStore = None) -> None:
-    """Called after every poll. Fires token milestone alerts for both bands."""
+def seed_milestones(snap: dict, usage: UsageStore,
+                    subs: "SubscriberStore" = None, names: "NameStore" = None) -> None:
+    """On bot launch, fire only the single highest already-crossed milestone per track,
+    then silently mark all lower ones. If usage hasn't reached the first milestone of a
+    track no notification is sent for that track. Sets the seeded flag when done."""
+    total_normal  = snap.get("total_normal_tokens", 0)
+    total_premium = snap.get("total_premium_tokens", 0)
+
+    # ── Normal band ────────────────────────────────────────────────────────
+    top_normal: tuple = None   # (threshold, level) of the highest crossed milestone
+    for threshold, level in TOKEN_MILESTONES:
+        if total_normal >= threshold:
+            top_normal = (threshold, level)
+
+    for threshold, _ in TOKEN_MILESTONES:          # mark all silently
+        if total_normal >= threshold:
+            usage.add_milestone_notified(threshold)
+
+    if top_normal and subs:
+        t, l = top_normal
+        if names:
+            _broadcast_named(
+                lambda n, t=t, c=total_normal, l=l: fmt_token_milestone(t, c, l, n),
+                subs, names,
+            )
+        else:
+            _send_all(fmt_token_milestone(t, total_normal, l), subs)
+
+    # ── Premium band ───────────────────────────────────────────────────────
+    top_premium: tuple = None
+    for threshold, level in PREMIUM_TOKEN_MILESTONES:
+        if total_premium >= threshold:
+            top_premium = (threshold, level)
+
+    for threshold, _ in PREMIUM_TOKEN_MILESTONES:  # mark all silently
+        if total_premium >= threshold:
+            usage.add_premium_milestone_notified(threshold)
+
+    if top_premium and subs:
+        t, l = top_premium
+        if names:
+            _broadcast_named(
+                lambda n, t=t, c=total_premium, l=l: fmt_premium_token_milestone(t, c, l, n),
+                subs, names,
+            )
+        else:
+            _send_all(fmt_premium_token_milestone(t, total_premium, l), subs)
+
+    usage.mark_seeded()
+
+
+def check_milestones(snap: dict, usage: UsageStore, subs: SubscriberStore, names: NameStore = None) -> bool:
+    """Called after every non-seed poll. Fires alerts for newly crossed thresholds.
+    Returns True if at least one new milestone was hit (used to trigger urgent mode)."""
+    hit = False
+
     # Normal band (10M free daily)
     total_tok = snap.get("total_normal_tokens", 0)
     notified  = usage.get_milestones_notified()
     for threshold, level in TOKEN_MILESTONES:
         if total_tok >= threshold and threshold not in notified:
+            hit = True
             usage.add_milestone_notified(threshold)
             if names:
                 _broadcast_named(lambda n, t=threshold, c=total_tok, l=level: fmt_token_milestone(t, c, l, n), subs, names)
@@ -971,11 +1174,14 @@ def check_milestones(snap: dict, usage: UsageStore, subs: SubscriberStore, names
     notified_premium = usage.get_premium_milestones_notified()
     for threshold, level in PREMIUM_TOKEN_MILESTONES:
         if total_premium >= threshold and threshold not in notified_premium:
+            hit = True
             usage.add_premium_milestone_notified(threshold)
             if names:
                 _broadcast_named(lambda n, t=threshold, c=total_premium, l=level: fmt_premium_token_milestone(t, c, l, n), subs, names)
             else:
                 _send_all(fmt_premium_token_milestone(threshold, total_premium, level), subs)
+
+    return hit
 
 
 # ── Command handlers ───────────────────────────────────────────────────────
@@ -1120,32 +1326,69 @@ def cmd_active(usage: UsageStore, name: str = "Bach") -> str:
     return "\n".join(lines)
 
 
-def cmd_refresh(usage: UsageStore, subs: SubscriberStore, name: str = "Bach") -> str:
+def cmd_refresh(usage: UsageStore, subs: SubscriberStore, names: NameStore = None, name: str = "Bach") -> str:
     snap = fetch_today_usage()
     if snap:
         usage.update(snap)
-        check_milestones(snap, usage, subs)
+        # If the scheduled poll loop hasn't run its first seed yet, seed now.
+        # Only the highest already-crossed milestone fires (no flood).
+        if not usage.has_seeded():
+            seed_milestones(snap, usage, subs, names)
+            new_milestone = False
+        else:
+            new_milestone = check_milestones(snap, usage, subs, names)
         enriched      = _enrich_costs(snap, usage)
         total         = enriched.get("total_cost", 0.0)
         total_tok     = sum(p.get("total_tokens", 0) for p in snap.get("projects", {}).values())
         total_premium = snap.get("total_premium_tokens", 0)
         total_normal  = snap.get("total_normal_tokens",  0)
-        stale_note    = f"  <i>(cost as of {_fmt_ts(enriched.get('costs_ts'))})</i>" if enriched.get("costs_stale") else ""
+
+        mode             = usage.get_mode()
+        mode_note        = ""
+        normal_exceeded  = total_normal  >= TOKEN_HARD_CAP
+        premium_exceeded = total_premium >= PREMIUM_TOKEN_HARD_CAP
+
+        if normal_exceeded or premium_exceeded:
+            activity = _fetch_recent_activity(minutes=OVERCAP_WINDOW_MINS)
+            active   = {pid: c for pid, c in activity.items() if c > 0}
+            if active:
+                usage.update_last_illegal_seen()
+                if mode != "aggressive":
+                    usage.set_mode("aggressive")
+                if names:
+                    _broadcast_named(
+                        lambda n, a=active, ne=normal_exceeded, pe=premium_exceeded:
+                            fmt_overcap_active_alert(a, ne, pe, n),
+                        subs, names,
+                    )
+                else:
+                    _send_all(fmt_overcap_active_alert(active, normal_exceeded, premium_exceeded), subs)
+                mode_note = "\n🔴 <b>AGGRESSIVE mode active — illegal projects detected, broadcast sent.</b>"
+            else:
+                mode_note = "\n⚠️ Budget cap exceeded — no active projects detected right now."
+        elif new_milestone and mode == "passive":
+            usage.set_mode("urgent")
+            usage.set_last_milestone_ts(time.time())
+            mode_note = "\n📊 Milestone crossed — switched to <b>URGENT</b> polling mode."
+
+        stale_note = f"  <i>(cost as of {_fmt_ts(enriched.get('costs_ts'))})</i>" if enriched.get("costs_stale") else ""
         lines = [
-            f"🔄 <b>Data refreshed.</b>",
+            "🔄 <b>Data refreshed.</b>",
             f"Tokens today: <b>{_fmt_tokens(total_tok)}</b>",
             f"   ⭐ Premium (1M):  <b>{_fmt_tokens(total_premium)}</b> / 1M",
             f"   📦 Normal (10M): <b>{_fmt_tokens(total_normal)}</b> / 10M",
             f"Spend today:  <b>${total:.4f}</b>{stale_note}",
             f"<i>Intelligence updated, Monarch {name}.</i>",
         ]
+        if mode_note:
+            lines.append(mode_note)
         return "\n".join(lines)
     # Token fetch failed — return last cached snapshot
     cached = usage.get()
     if cached and cached.get("projects"):
         enriched = _enrich_costs(cached, usage, live=False)
         return (
-            f"⚠️ <b>OpenAI API unreachable — showing last known data.</b>\n\n"
+            "⚠️ <b>OpenAI API unreachable — showing last known data.</b>\n\n"
             + fmt_daily_snapshot(enriched)
         )
     return f"OpenAI API unreachable and no prior data on record, Monarch {name}."
@@ -1322,7 +1565,7 @@ def dispatch(text: str, usage: UsageStore, subs: SubscriberStore,
         "recent":   lambda: cmd_recent(name),
         "models":   lambda: cmd_models(usage, name),
         "active":   lambda: cmd_active(usage, name),
-        "refresh":  lambda: cmd_refresh(usage, subs, name),
+        "refresh":  lambda: cmd_refresh(usage, subs, names, name),
         "arise":    lambda: cmd_arise(chat_id, subs, name, thread_id),
         "dismiss":  lambda: cmd_dismiss(chat_id, subs, name),
         "help":     lambda: cmd_help(bot_username, name),
@@ -1370,26 +1613,29 @@ def telegram_poll_loop(usage: UsageStore, subs: SubscriberStore,
 # ── Usage poll thread ──────────────────────────────────────────────────────
 
 def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore = None) -> None:
-    # Reset on startup if persisted state is from a previous day
+    # Reset stale state from a previous day on startup
     persisted_date = usage.get().get("date")
     last_date      = today_str()
     if persisted_date and persisted_date != last_date:
         usage.reset_day()
         print(f"[poll] Stale state from {persisted_date} — daily state reset on startup")
 
+    first_poll = True   # first poll of each day: seed milestones, never alert
     fail_count = 0
 
     while True:
+        snap = None
         try:
             current_date = today_str()
             if current_date != last_date:
                 usage.reset_day()
-                last_date = current_date
+                last_date  = current_date
+                first_poll = True
                 print(f"[poll] New day {current_date} — daily state reset")
 
             snap = fetch_today_usage()
             if snap:
-                # Fetch costs and overlay onto snapshot; fall back to cache on failure
+                # Overlay costs; fall back to cache on failure
                 costs = _fetch_costs()
                 if costs:
                     org_cost = costs.pop("__org__", 0.0)
@@ -1411,22 +1657,68 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                 n_str    = _color(f"{_fmt_tokens(normal_tok)}/10M",  _tok_color(normal_tok,  TOKEN_HARD_CAP))
                 p_str    = _color(f"{_fmt_tokens(premium_tok)}/1M",  _tok_color(premium_tok, PREMIUM_TOKEN_HARD_CAP))
                 cost_str = f"  cost=${snap.get('total_cost', 0.0):.4f}" if snap.get("total_cost") else ""
-                print(f"[poll] {current_date}  normal={n_str}  premium={p_str}{cost_str}")
+                print(f"[poll/{usage.get_mode()}] {current_date}  normal={n_str}  premium={p_str}{cost_str}")
 
-                check_milestones(snap, usage, subs, names)
+                # ── Milestone handling ──────────────────────────────────────
+                if first_poll:
+                    seed_milestones(snap, usage, subs, names)
+                    first_poll = False
+                    print("[poll] First poll of day — milestone status notified")
+                else:
+                    new_ms = check_milestones(snap, usage, subs, names)
+                    mode   = usage.get_mode()
+                    if new_ms and mode != "aggressive":
+                        if mode == "urgent":
+                            usage.reset_urgent_step()  # new milestone → restart from 3 min
+                        else:
+                            usage.set_mode("urgent")
+                            print("[mode] → URGENT (milestone crossed)")
+                        usage.set_last_milestone_ts(time.time())
+
+                # ── Cap check (runs every poll regardless of mode) ──────────
+                normal_exceeded  = normal_tok >= TOKEN_HARD_CAP
+                premium_exceeded = premium_tok >= PREMIUM_TOKEN_HARD_CAP
+
+                if normal_exceeded or premium_exceeded:
+                    _handle_overcap(snap, usage, subs, names, normal_exceeded, premium_exceeded)
+                else:
+                    mode = usage.get_mode()
+                    if mode == "urgent":
+                        last_ms = usage.get_last_milestone_ts()
+                        if last_ms and time.time() - last_ms > URGENT_REVERT_SECS:
+                            usage.set_mode("passive")
+                            print("[mode] → PASSIVE (1 h without new milestone)")
+                    elif mode == "aggressive":
+                        # Caps cleared (day rolled over mid-aggressive), revert
+                        usage.set_mode("passive")
+                        print("[mode] → PASSIVE (caps no longer exceeded)")
+
                 fail_count = 0
+
             else:
                 fail_count += 1
-                wait = min(POLL_INTERVAL * (2 ** min(fail_count - 1, 6)), 3600)
-                print(f"[poll] Fetch failed ({fail_count}) — retry in {wait // 60:.0f}min (backoff)")
-                time.sleep(wait)
+                mode     = usage.get_mode()
+                base     = PASSIVE_INTERVAL_SECS if mode == "passive" else URGENT_INTERVAL_MIN
+                max_back = PASSIVE_BACKOFF_MAX   if mode == "passive" else URGENT_INTERVAL_MAX
+                backoff  = min(base * (2 ** min(fail_count - 1, 4)), max_back)
+                print(f"[poll] Fetch failed ({fail_count}) — retry in {backoff // 60:.0f} min (backoff)")
+                time.sleep(backoff)
                 continue
 
         except Exception as e:
             print(f"[poll loop error] {e}")
             fail_count += 1
 
-        time.sleep(POLL_INTERVAL)
+        # ── Determine next sleep interval ───────────────────────────────────
+        mode = usage.get_mode()
+        if mode == "passive":
+            sleep_secs = PASSIVE_INTERVAL_SECS
+        else:
+            sleep_secs = usage.get_urgent_interval()
+            usage.increment_urgent_step()
+
+        print(f"[poll] Next poll in {sleep_secs // 60:.0f} min  (mode={mode})")
+        time.sleep(sleep_secs)
 
 
 # ── Concurrency check thread ───────────────────────────────────────────────
