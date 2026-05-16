@@ -56,16 +56,20 @@ main()
 
 usage_poll_loop()
   └── dynamic sleep (mode-dependent):
-       ├── fetch_today_usage()   → tokens per project/model
-       ├── _fetch_costs()        → cost per project
-       ├── seed_milestones()     ← first poll only (fires top-1 milestone per track)
-       ├── check_milestones()    ← subsequent polls (may fire alerts)
-       ├── _handle_overcap()     ← if any cap exceeded (may broadcast)
-       └── mode transition logic → passive / urgent / aggressive
+       ├── fetch_today_usage()           → tokens per project, classified by band
+       ├── _fetch_costs()                → cost per project
+       ├── usage.update(snap)            → auto-resets daily state on date change
+       ├── seed_milestones() if !seeded  → fires top-1 milestone per track (idempotent)
+       ├── check_milestones() otherwise  → fires on newly crossed thresholds
+       ├── _handle_overcap()             → if any cap exceeded:
+       │     ├── _fetch_recent_activity_by_band()  → per-project, per-band counts
+       │     └── _filter_to_exceeded_band()        → drop projects only using OK band
+       └── mode transition logic         → passive / urgent / aggressive
 
 concurrency_check_loop()
   └── every CONCURRENCY_WINDOW_MINS (5 min):
        └── _fetch_recent_activity() → alert if ≥3 projects active simultaneously
+                                      (preserves last snapshot on API failure)
 ```
 
 ---
@@ -122,6 +126,19 @@ Regular `sk-...` keys cannot access `/v1/organization/*` endpoints.
 Must use an **Admin API key** (`sk-admin-...`):
 Platform → Organization → API Keys → Create Admin Key
 
+### Model classification
+`_is_premium_model(model)` in source is the single source of truth. Order of checks:
+
+1. **Normal-band prefix match** (listed mini/nano variants) → normal.
+2. **`mini`/`nano` substring** anywhere in name → normal (catches unlisted future
+   variants like `gpt-5.5-mini`).
+3. Anything else → premium.
+
+`PREMIUM_MODEL_PREFIXES` is kept in source as documentation of the listed premium models
+but is not consulted at runtime — the order above means premium status is the catch-all
+fallback. This is conservative for free-tier alerting (unknown full-size models count
+against the lower 1M cap rather than going untracked).
+
 ---
 
 ## 6. Polling Modes
@@ -143,10 +160,16 @@ Hitting a new milestone within the 1-hour window **resets the interval back to 3
 **Behaviour:** Same as passive, but at a shorter interval. Cap breaches still trigger aggressive.
 
 ### Aggressive Mode
-**Trigger:** Either cap (10M normal or 1M premium) is exceeded **and** at least one project was active in the last 20 minutes (`OVERCAP_WINDOW_MINS`, wider than the concurrency window to account for OpenAI's 5–15 min ingestion lag).
+**Trigger:** Either cap is exceeded **and** at least one project has recent activity
+**on the EXCEEDED band** within the last 20 minutes (`OVERCAP_WINDOW_MINS`). Per-band
+filtering means premium-track usage does not raise the alarm when only the normal cap
+is exceeded, and vice versa.
 **Poll interval:** Same 3→10 min progression as urgent mode.
-**Behaviour:** On every poll, fetches recent activity and broadcasts an urgent red-tone alert if any projects are still running. No cooldown — broadcasts fire every poll while illegal activity is detected.
-**Revert condition:** 1 hour passes since the last poll that found active illegal projects.
+**Behaviour:** On every poll, fetches banded recent activity, filters to projects with
+usage on the exceeded band(s), and broadcasts an urgent red-tone alert listing each
+project with its per-band request counts. No cooldown — broadcasts fire every poll
+while illegal activity is detected.
+**Revert condition:** 1 hour passes since the last poll that found active illegal-band activity.
 
 ### Mode Transition Summary
 
@@ -173,7 +196,7 @@ When the user issues `/refresh`, the bot:
 ## 7. Notification System
 
 ### 7.1 Startup Milestone Seeding
-On the **first poll of each day** (including after a bot restart), `seed_milestones()` runs.
+On the **first poll of each UTC day** (including after a bot restart), `seed_milestones()` runs.
 It fires **exactly one notification per track** — the highest threshold already crossed — so the
 user knows the current status without being flooded.
 
@@ -184,12 +207,18 @@ Example: normal tokens at 7.5M → fires the 7M milestone only, silently marks 1
 
 Subsequent polls use `check_milestones()` which only fires on **newly crossed** thresholds.
 
-A `milestones_seeded` flag (persisted in `usage_state.json`) prevents a race condition where
-the Telegram thread processes a `/refresh` command before the usage poll thread has run its
-first seed. If `/refresh` arrives first, it calls `seed_milestones()` itself and sets the flag.
+**Idempotency**: `seed_milestones()` self-guards via `usage.has_seeded()` and returns
+immediately if the day has already been seeded. This closes the race where the Telegram
+thread runs `/refresh` before the usage poll thread's first iteration: whichever fires
+first does the seed; the second is a no-op. The flag is reset by day rollover (handled
+inside `UsageStore.update()` and on stale-date load in `UsageStore.__init__`).
 
 ### 7.2 Normal-Band Token Milestones (10M/day free)
-Applies to: gpt-4o-mini, o1-mini, o3-mini, o4-mini, gpt-4.1-mini/nano, and other mini/nano models.
+Applies to OpenAI's listed normal-band models:
+`gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5.1-codex-mini`, `gpt-5-mini`, `gpt-5-nano`,
+`gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-4o-mini`, `o1-mini`, `o3-mini`, `o4-mini`,
+`codex-mini-latest`.
+Any other model with `mini` or `nano` in its name is also treated as normal-band.
 
 | Threshold | Level | Tone |
 |---|---|---|
@@ -197,11 +226,16 @@ Applies to: gpt-4o-mini, o1-mini, o3-mini, o4-mini, gpt-4.1-mini/nano, and other
 | 8M, 9M | urgent | Warning — approaching the cap |
 | 10M | cap | Cap reached — free tier exhausted, billing starts |
 
-Each threshold fires **once per UTC day**. Crossing the cap milestone also triggers
-an immediate check for active illegal projects.
+Each threshold fires **once per UTC day**. Crossing the cap milestone arms the
+overcap detector — subsequent polls broadcast aggressive alerts as long as
+projects keep burning normal-band tokens.
 
 ### 7.3 Premium-Band Token Milestones (1M/day free)
-Applies to: gpt-4o, gpt-4.1, o1, o3, gpt-5, and other full-size models.
+Applies to OpenAI's listed premium-band models:
+`gpt-5.4`, `gpt-5.2`, `gpt-5.1`, `gpt-5.1-codex`, `gpt-5`, `gpt-5-codex`,
+`gpt-5-chat-latest`, `gpt-4.1`, `gpt-4o`, `o1`, `o3`.
+Unknown full-size models (no `mini`/`nano` in the name) also count here — conservative
+default for free-tier alerting.
 
 | Threshold | Level | Tone |
 |---|---|---|
@@ -210,27 +244,37 @@ Applies to: gpt-4o, gpt-4.1, o1, o3, gpt-5, and other full-size models.
 | 1M | cap | Cap reached — billing starts |
 
 ### 7.4 Overcap Active-Project Alerts (Aggressive Mode)
-**Condition:** Cap exceeded + projects active in last 20 min (`OVERCAP_WINDOW_MINS`).
+**Condition:** Cap exceeded **and** at least one project has activity in the EXCEEDED
+band within the last 20 min (`OVERCAP_WINDOW_MINS`).
 **Frequency:** Every poll while in aggressive mode (3–10 min interval) — no cooldown.
-**Tone:** Red, urgent, named-project list, explicit "halt" command.
+**Tone:** Red, urgent, named-project list with per-band request counts, explicit "halt" command.
 
-The 20-minute window (vs. 5 min for concurrency) exists because OpenAI usage data has a
-5–15 min ingestion lag. A 5-min window would miss activity that happened 9 minutes ago.
+Crucial detail: the filter is per-band. If only the **Normal (10M)** cap is exceeded,
+a project burning only premium-band tokens does **not** trigger the alarm — premium is
+still under its 1M allowance. The bot fetches recent activity grouped by both project
+and model, classifies each model into a band, and then keeps only projects with usage
+on the exceeded band(s).
 
-Format:
+The 20-min window (vs. 5 min for concurrency) absorbs OpenAI's 5–15 min ingestion lag —
+a 5-min window would miss activity that completed 9 min ago and hasn't shown up yet.
+
+Format (example: only the normal cap exceeded; phongnguyen's premium-only usage is correctly suppressed):
 ```
 🔴 ‼️ BUDGET BREACHED — ILLEGAL ACTIVITY DETECTED ‼️
 
 The Normal (10M) free-tier allowance is exhausted.
-These projects are still running — every request now burns real funds:
+These projects are still burning the exhausted band — every request now bills:
 
-🚨 khonlanh-project  —  142 requests in the last 20 min
-🚨 phongnguyen-project  —  38 requests in the last 20 min
+🚨 khonlanh-project  —  142 normal reqs in the last 20 min
+🚨 ngjabach-project  —  7 normal reqs in the last 20 min
 
 HALT ALL NON-ESSENTIAL OPERATIONS IMMEDIATELY.
 (Activity window: last 20 min — accounts for API ingestion lag)
 Monarch Bach — the treasury is bleeding. Your command is required at once.
 ```
+
+When both caps are exceeded the entry shows a combined breakdown
+(e.g. `7 normal + 3 premium reqs`).
 
 ### 7.5 Daily Spend Alerts
 **Status: Not currently active.**
@@ -312,7 +356,17 @@ Fields preserved across snapshot updates (not overwritten by each poll):
 | `urgent_poll_step` | int | Current step in 3→10 min interval progression |
 | `milestones_seeded` | bool | True after first-poll seed runs; guards the /refresh race condition |
 
-All fields reset at UTC midnight via `reset_day()`.
+All fields reset at UTC midnight. Two reset paths, both internal:
+
+- `UsageStore.__init__`: on load, if the persisted `date` is older than today, reset
+  immediately so commands hitting the store before the first poll don't see yesterday's
+  data.
+- `UsageStore.update()`: each poll's snapshot carries today's date. If it differs from
+  the persisted date, the store auto-resets before merging. This closes the race where
+  the Telegram thread runs `/refresh` on a new day before the poll loop notices the
+  rollover.
+
+Both paths share `_reset_daily_state_locked()` (private — caller must hold the store lock).
 
 ### `bot_data/subscribers.json`
 JSON array of chat ID strings. Primary chat (`TELEGRAM_CHAT_ID`) is always included and cannot be removed.
@@ -371,4 +425,7 @@ On startup the bot:
 - **Telegram offset** — `telegram_poll_loop` advances `offset` before handling each update. A crash mid-handler never causes a message to be re-processed.
 - **UTC alignment** — All dates use UTC. If running in Vietnam (UTC+7), "today" in UTC starts 7 hours behind local midnight. This matches OpenAI's billing day.
 - **Aggressive mode no-cooldown** — Overcap active-project broadcasts fire every poll (3–10 min) with no cooldown by design. This is intentional: the situation is a financial emergency and the team must be continuously reminded until action is taken.
-- **Concurrency loop is independent** — `concurrency_check_loop` runs every 5 minutes regardless of the current poll mode. It has its own 15-minute cooldown and is a separate concern from budget caps.
+- **Concurrency loop is independent** — `concurrency_check_loop` runs every 5 minutes regardless of the current poll mode. It has its own 15-minute cooldown and is a separate concern from budget caps. On API failure it preserves the last known active-projects snapshot instead of overwriting with `{}`, so a brief network blip doesn't make the `/active` command show "no activity" misleadingly.
+- **Per-band overcap filtering** — `_fetch_recent_activity_by_band()` groups recent requests by both project and model. `_handle_overcap()` then keeps only projects with activity on the EXCEEDED band(s). A project using premium models cannot trigger the normal-cap alarm and vice versa.
+- **Activity fetch failure** — `_fetch_recent_activity*` return `None` on API failure (distinguished from `{}` meaning "no activity"). Callers preserve the previous mode/state rather than acting on missing data.
+- **Telegram poll backoff** — `_get_updates()` sleeps 5 s on network error before returning to avoid a tight reconnect loop. Successful long-polls return immediately without added sleep.

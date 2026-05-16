@@ -106,6 +106,30 @@ KNOWN_PROJECTS: dict[str, str] = {
 OPENAI_COSTS_URL = "https://api.openai.com/v1/organization/costs"
 OPENAI_USAGE_URL = "https://api.openai.com/v1/organization/usage/completions"
 
+# ── Free-tier model classification (from OpenAI's free-usage page) ─────────
+# Match by prefix so date-suffixed variants ("gpt-4o-mini-2024-07-18") still classify.
+# Normal-band models share 10M tokens/day free:
+NORMAL_MODEL_PREFIXES = (
+    "gpt-5.4-mini", "gpt-5.4-nano",
+    "gpt-5.1-codex-mini",
+    "gpt-5-mini", "gpt-5-nano",
+    "gpt-4.1-mini", "gpt-4.1-nano",
+    "gpt-4o-mini",
+    "o1-mini",
+    "o3-mini", "o4-mini",
+    "codex-mini-latest",
+)
+# Premium-band models share 1M tokens/day free:
+PREMIUM_MODEL_PREFIXES = (
+    "gpt-5.4", "gpt-5.2",
+    "gpt-5.1-codex", "gpt-5.1",
+    "gpt-5-codex", "gpt-5-chat-latest", "gpt-5",
+    "gpt-4.1",
+    "gpt-4o",
+    "o1",
+    "o3",
+)
+
 # ── Terminal colors (ANSI) ──────────────────────────────────────────────────
 _C_GREEN  = "\033[32m"
 _C_YELLOW = "\033[33m"
@@ -126,14 +150,21 @@ def _color(text: str, code: str) -> str:
 # ── Model band classifier ──────────────────────────────────────────────────
 
 def _is_premium_model(model: str) -> bool:
-    """
-    Returns True if the model is in the 1M/day free-tier band (premium),
-    False if it's in the 10M/day band (mini/nano models).
-    Rule: any model containing 'mini' or 'nano' is in the normal (10M) band.
-    Everything else (full-size models) is in the premium (1M) band.
-    """
+    """True if the model belongs to the 1M/day premium band; False for the 10M normal band.
+
+    Classification order (mini/nano always wins, even if the listed premium prefix matches):
+      1. Explicit normal prefixes (listed mini/nano variants)        → normal.
+      2. 'mini' or 'nano' substring anywhere                          → normal.
+         (covers unlisted future variants like 'gpt-5.5-mini' that would otherwise be
+         caught by the broader 'gpt-5' premium prefix.)
+      3. Anything else (listed premium + unknown full-size)           → premium.
+    Premium-by-default is the conservative choice for free-tier alerting."""
     m = model.lower()
-    return "mini" not in m and "nano" not in m
+    if any(m.startswith(p) for p in NORMAL_MODEL_PREFIXES):
+        return False
+    if "mini" in m or "nano" in m:
+        return False
+    return True
 
 
 # ── Time helpers ───────────────────────────────────────────────────────────
@@ -323,8 +354,10 @@ def _fetch_monthly_costs(year: int, month: int) -> dict[str, float]:
     return costs
 
 
-def _fetch_recent_activity(minutes: int = CONCURRENCY_WINDOW_MINS) -> dict[str, int]:
-    """Request count per project in the last `minutes` minutes (minute-level buckets)."""
+def _fetch_recent_activity(minutes: int = CONCURRENCY_WINDOW_MINS) -> Optional[dict[str, int]]:
+    """Request count per project in the last `minutes` minutes (minute-level buckets).
+    Returns None on API failure so callers can preserve the previous snapshot
+    instead of overwriting it with a misleading empty dict."""
     now   = int(time.time())
     start = now - minutes * 60
     params = [
@@ -338,10 +371,10 @@ def _fetch_recent_activity(minutes: int = CONCURRENCY_WINDOW_MINS) -> dict[str, 
         r = requests.get(OPENAI_USAGE_URL, headers=_openai_headers(), params=params, timeout=REQUEST_TIMEOUT)
     except Exception as e:
         print(f"[openai activity error] {e}")
-        return {}
+        return None
     if not r.ok:
         print(f"[openai activity {r.status_code}] {r.text[:300]}")
-        return {}
+        return None
     activity: dict[str, int] = {}
     for bucket in r.json().get("data", []):
         for result in bucket.get("results", []):
@@ -350,6 +383,56 @@ def _fetch_recent_activity(minutes: int = CONCURRENCY_WINDOW_MINS) -> dict[str, 
             if pid and reqs > 0:
                 activity[pid] = activity.get(pid, 0) + reqs
     return activity
+
+
+def _fetch_recent_activity_by_band(minutes: int) -> Optional[dict[str, dict[str, int]]]:
+    """Per-project recent request counts broken down by model band.
+    Returns {pid: {"normal": <reqs>, "premium": <reqs>}} for the last `minutes` minutes,
+    or None on API failure. Used by overcap detection to filter projects to only those
+    actually using the EXCEEDED band — a project burning premium tokens does not
+    trigger the normal-cap alarm and vice versa."""
+    now   = int(time.time())
+    start = now - minutes * 60
+    params = [
+        ("start_time",   start),
+        ("end_time",     now),
+        ("bucket_width", "1m"),
+        ("group_by[]",   "project_id"),
+        ("group_by[]",   "model"),
+        ("limit",        100),
+    ]
+    try:
+        r = requests.get(OPENAI_USAGE_URL, headers=_openai_headers(), params=params, timeout=REQUEST_TIMEOUT)
+    except Exception as e:
+        print(f"[openai activity-by-band error] {e}")
+        return None
+    if not r.ok:
+        print(f"[openai activity-by-band {r.status_code}] {r.text[:300]}")
+        return None
+    out: dict[str, dict[str, int]] = {}
+    for bucket in r.json().get("data", []):
+        for result in bucket.get("results", []):
+            pid   = result.get("project_id", "")
+            model = result.get("model", "")
+            reqs  = result.get("num_model_requests", 0)
+            if not pid or reqs <= 0:
+                continue
+            band  = "premium" if _is_premium_model(model) else "normal"
+            slot  = out.setdefault(pid, {"normal": 0, "premium": 0})
+            slot[band] += reqs
+    return out
+
+
+def _filter_to_exceeded_band(banded: dict[str, dict[str, int]],
+                             normal_exceeded: bool, premium_exceeded: bool) -> dict[str, dict[str, int]]:
+    """From banded recent activity, return only projects with usage on an exceeded band.
+    Preserves the full per-band breakdown so the alert formatter can show detail."""
+    out: dict[str, dict[str, int]] = {}
+    for pid, bands in banded.items():
+        if (normal_exceeded and bands.get("normal", 0) > 0) \
+           or (premium_exceeded and bands.get("premium", 0) > 0):
+            out[pid] = bands
+    return out
 
 
 def _fetch_recent_data(days: int = 31) -> dict:
@@ -526,6 +609,17 @@ class UsageStore:
         self._lock = threading.Lock()
         self._data: dict = {}
         self._load()
+        # If loaded state is from a previous day, reset daily fields immediately
+        # so /tokens, /refresh, etc. don't surface yesterday's numbers in the
+        # window between bot start and the first poll.
+        persisted = self._data.get("date")
+        today     = today_str()
+        if persisted and persisted != today:
+            with self._lock:
+                print(f"[store] Loaded state from {persisted} — resetting daily state for {today}")
+                self._reset_daily_state_locked()
+                self._data["date"] = today
+                self._save()
 
     def _load(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -540,28 +634,51 @@ class UsageStore:
         with self.path.open("w", encoding="utf-8") as f:
             json.dump(self._data, f, indent=2)
 
+    def _reset_daily_state_locked(self):
+        """Reset all daily alert/mode state. Caller must hold self._lock."""
+        self._data["alert_sent"]                  = False
+        self._data["token_milestones_notified"]   = []
+        self._data["premium_milestones_notified"] = []
+        self._data["spend_intervals_notified"]    = 0
+        self._data["bot_mode"]                    = "passive"
+        self._data["mode_entered_ts"]             = None
+        self._data["last_milestone_ts"]           = None
+        self._data["last_illegal_seen_ts"]        = None
+        self._data["urgent_poll_step"]            = 0
+        self._data["milestones_seeded"]           = False
+        self._data.pop("costs_cache", None)
+
     def update(self, snapshot: dict):
-        """Merge new snapshot, preserving all alert-control fields."""
+        """Merge new snapshot, preserving all alert-control fields.
+        Auto-resets daily state if the snapshot's date is newer than the persisted date.
+        Day rollover handled here closes the race where the Telegram thread runs /refresh
+        on a new day before the poll loop notices."""
         with self._lock:
+            new_date = snapshot.get("date")
+            old_date = self._data.get("date")
+            if new_date and old_date and new_date != old_date:
+                print(f"[store] Day rollover {old_date} → {new_date} — daily state reset")
+                self._reset_daily_state_locked()
             preserved = {k: self._data[k] for k in self._PRESERVED if k in self._data}
             self._data = snapshot
             self._data.update(preserved)
             self._save()
 
-    def reset_day(self):
-        """Called at UTC midnight — resets all daily alert and mode state."""
+    def seed_state(self, normal_thresholds: list, premium_thresholds: list) -> None:
+        """Bulk-mark seeded milestones in one disk write. Always sets milestones_seeded=True,
+        even when both lists are empty (so unseeded fresh days still flip the flag)."""
         with self._lock:
-            self._data["alert_sent"]                  = False
-            self._data["token_milestones_notified"]   = []
-            self._data["premium_milestones_notified"] = []
-            self._data["spend_intervals_notified"]    = 0
-            self._data["bot_mode"]                    = "passive"
-            self._data["mode_entered_ts"]             = None
-            self._data["last_milestone_ts"]           = None
-            self._data["last_illegal_seen_ts"]        = None
-            self._data["urgent_poll_step"]            = 0
-            self._data["milestones_seeded"]           = False
-            self._data.pop("costs_cache", None)
+            if normal_thresholds:
+                ms = self._data.setdefault("token_milestones_notified", [])
+                for t in normal_thresholds:
+                    if t not in ms:
+                        ms.append(t)
+            if premium_thresholds:
+                ms = self._data.setdefault("premium_milestones_notified", [])
+                for t in premium_thresholds:
+                    if t not in ms:
+                        ms.append(t)
+            self._data["milestones_seeded"] = True
             self._save()
 
     def get(self) -> dict:
@@ -706,14 +823,11 @@ class UsageStore:
             self._save()
 
     def has_seeded(self) -> bool:
-        """True once seed_milestones() has run for today — guards cmd_refresh race."""
+        """True once seed_milestones() has run for today. Both the poll loop and
+        cmd_refresh consult this so whichever fires first does the seed; the other
+        becomes a no-op."""
         with self._lock:
             return self._data.get("milestones_seeded", False)
-
-    def mark_seeded(self) -> None:
-        with self._lock:
-            self._data["milestones_seeded"] = True
-            self._save()
 
 
 # ── Subscriber store ───────────────────────────────────────────────────────
@@ -858,6 +972,7 @@ def _get_updates(offset: int) -> list[dict]:
         return r.json().get("result", [])
     except Exception as e:
         print(f"[poll error] {e}")
+        time.sleep(5)   # avoid a tight reconnect loop on persistent failure
         return []
 
 
@@ -959,7 +1074,10 @@ def fmt_concurrency_alert(active: dict, name: str = "Bach") -> str:
     return "\n".join(lines)
 
 
-def fmt_overcap_active_alert(active: dict, normal_exceeded: bool, premium_exceeded: bool, name: str = "Bach") -> str:
+def fmt_overcap_active_alert(banded_active: dict, normal_exceeded: bool, premium_exceeded: bool,
+                             name: str = "Bach") -> str:
+    """Render the red-tone overcap alert. `banded_active` maps pid → {"normal": int, "premium": int}
+    and contains only projects with usage on at least one exceeded band."""
     bands = []
     if normal_exceeded:
         bands.append("Normal (10M)")
@@ -967,14 +1085,26 @@ def fmt_overcap_active_alert(active: dict, normal_exceeded: bool, premium_exceed
         bands.append("Premium (1M)")
     band_str = " & ".join(bands)
 
+    def _illegal_reqs(b: dict) -> int:
+        r = 0
+        if normal_exceeded:  r += b.get("normal", 0)
+        if premium_exceeded: r += b.get("premium", 0)
+        return r
+
     lines = [
         f"🔴 <b>‼️ BUDGET BREACHED — ILLEGAL ACTIVITY DETECTED ‼️</b>\n",
         f"The <b>{band_str}</b> free-tier allowance is <b>exhausted</b>.",
-        f"These projects are <b>still running</b> — every request now burns real funds:\n",
+        f"These projects are <b>still burning the exhausted band</b> — every request now bills:\n",
     ]
-    for pid, count in sorted(active.items(), key=lambda x: x[1], reverse=True):
+    for pid, b in sorted(banded_active.items(), key=lambda x: _illegal_reqs(x[1]), reverse=True):
         proj_name = KNOWN_PROJECTS.get(pid, pid)
-        lines.append(f"🚨 <b>{proj_name}</b>  —  {count:,} requests in the last {OVERCAP_WINDOW_MINS} min")
+        parts = []
+        if normal_exceeded and b.get("normal", 0) > 0:
+            parts.append(f"{b['normal']:,} normal")
+        if premium_exceeded and b.get("premium", 0) > 0:
+            parts.append(f"{b['premium']:,} premium")
+        detail = " + ".join(parts)
+        lines.append(f"🚨 <b>{proj_name}</b>  —  {detail} reqs in the last {OVERCAP_WINDOW_MINS} min")
     lines.append(f"\n<b>HALT ALL NON-ESSENTIAL OPERATIONS IMMEDIATELY.</b>")
     lines.append(f"<i>(Activity window: last {OVERCAP_WINDOW_MINS} min — accounts for API ingestion lag)</i>")
     lines.append(f"<i>Monarch {name} — the treasury is bleeding. Your command is required at once.</i>")
@@ -985,31 +1115,36 @@ def fmt_overcap_active_alert(active: dict, normal_exceeded: bool, premium_exceed
 
 def _handle_overcap(snap: dict, usage: UsageStore, subs: SubscriberStore,
                     names: NameStore, normal_exceeded: bool, premium_exceeded: bool) -> None:
-    """Fetch recent activity. If any projects are active, enter aggressive mode and broadcast.
-    Uses OVERCAP_WINDOW_MINS (wider than concurrency window) to account for the 5–15 min
-    OpenAI ingestion lag. If quiet for AGGRESSIVE_REVERT_SECS, revert to passive."""
-    activity = _fetch_recent_activity(minutes=OVERCAP_WINDOW_MINS)
-    active   = {pid: c for pid, c in activity.items() if c > 0}
-    mode     = usage.get_mode()
+    """Fetch banded recent activity and broadcast only for projects burning the EXCEEDED band.
+    A project using premium models does not trigger the normal-cap alarm and vice versa.
+    Uses OVERCAP_WINDOW_MINS to absorb the 5–15 min OpenAI ingestion lag.
+    Reverts to passive after AGGRESSIVE_REVERT_SECS quiet on the exceeded band."""
+    banded = _fetch_recent_activity_by_band(minutes=OVERCAP_WINDOW_MINS)
+    if banded is None:
+        # API failure — keep current mode, don't broadcast or revert based on bad data.
+        print("[overcap] activity fetch failed — holding mode")
+        return
+    illegal = _filter_to_exceeded_band(banded, normal_exceeded, premium_exceeded)
+    mode    = usage.get_mode()
 
-    if active:
+    if illegal:
         usage.update_last_illegal_seen()
         if mode != "aggressive":
             usage.set_mode("aggressive")
-            print(f"[mode] → AGGRESSIVE ({len(active)} illegal project(s) active)")
+            print(f"[mode] → AGGRESSIVE ({len(illegal)} project(s) burning the exhausted band)")
         if names:
             _broadcast_named(
-                lambda n, a=active, ne=normal_exceeded, pe=premium_exceeded:
-                    fmt_overcap_active_alert(a, ne, pe, n),
+                lambda n, r=illegal, ne=normal_exceeded, pe=premium_exceeded:
+                    fmt_overcap_active_alert(r, ne, pe, n),
                 subs, names,
             )
         else:
-            _send_all(fmt_overcap_active_alert(active, normal_exceeded, premium_exceeded), subs)
+            _send_all(fmt_overcap_active_alert(illegal, normal_exceeded, premium_exceeded), subs)
     elif mode == "aggressive":
         last_ts = usage.get_last_illegal_seen_ts()
         if last_ts and time.time() - last_ts > AGGRESSIVE_REVERT_SECS:
             usage.set_mode("passive")
-            print("[mode] → PASSIVE (1 h since last illegal project — standing down)")
+            print("[mode] → PASSIVE (1 h since last illegal-band activity — standing down)")
 
 
 # ── Formatters — command responses ─────────────────────────────────────────
@@ -1057,24 +1192,26 @@ def fmt_daily_snapshot(snap: dict) -> str:
 
 def seed_milestones(snap: dict, usage: UsageStore,
                     subs: "SubscriberStore" = None, names: "NameStore" = None) -> None:
-    """On bot launch, fire only the single highest already-crossed milestone per track,
-    then silently mark all lower ones. If usage hasn't reached the first milestone of a
-    track no notification is sent for that track. Sets the seeded flag when done."""
+    """Fire only the highest already-crossed milestone per track on first poll of a day.
+    Idempotent: early-returns if already seeded — guards against double-broadcast when
+    /refresh and the poll loop race to seed first."""
+    if usage.has_seeded():
+        return
+
     total_normal  = snap.get("total_normal_tokens", 0)
     total_premium = snap.get("total_premium_tokens", 0)
 
-    # ── Normal band ────────────────────────────────────────────────────────
-    top_normal: tuple = None   # (threshold, level) of the highest crossed milestone
-    for threshold, level in TOKEN_MILESTONES:
-        if total_normal >= threshold:
-            top_normal = (threshold, level)
+    normal_crossed  = [(t, l) for t, l in TOKEN_MILESTONES         if total_normal  >= t]
+    premium_crossed = [(t, l) for t, l in PREMIUM_TOKEN_MILESTONES if total_premium >= t]
 
-    for threshold, _ in TOKEN_MILESTONES:          # mark all silently
-        if total_normal >= threshold:
-            usage.add_milestone_notified(threshold)
+    # One disk write marks every crossed threshold and flips milestones_seeded.
+    usage.seed_state(
+        normal_thresholds  = [t for t, _ in normal_crossed],
+        premium_thresholds = [t for t, _ in premium_crossed],
+    )
 
-    if top_normal and subs:
-        t, l = top_normal
+    if normal_crossed and subs:
+        t, l = normal_crossed[-1]   # highest crossed
         if names:
             _broadcast_named(
                 lambda n, t=t, c=total_normal, l=l: fmt_token_milestone(t, c, l, n),
@@ -1083,18 +1220,8 @@ def seed_milestones(snap: dict, usage: UsageStore,
         else:
             _send_all(fmt_token_milestone(t, total_normal, l), subs)
 
-    # ── Premium band ───────────────────────────────────────────────────────
-    top_premium: tuple = None
-    for threshold, level in PREMIUM_TOKEN_MILESTONES:
-        if total_premium >= threshold:
-            top_premium = (threshold, level)
-
-    for threshold, _ in PREMIUM_TOKEN_MILESTONES:  # mark all silently
-        if total_premium >= threshold:
-            usage.add_premium_milestone_notified(threshold)
-
-    if top_premium and subs:
-        t, l = top_premium
+    if premium_crossed and subs:
+        t, l = premium_crossed[-1]
         if names:
             _broadcast_named(
                 lambda n, t=t, c=total_premium, l=l: fmt_premium_token_milestone(t, c, l, n),
@@ -1102,8 +1229,6 @@ def seed_milestones(snap: dict, usage: UsageStore,
             )
         else:
             _send_all(fmt_premium_token_milestone(t, total_premium, l), subs)
-
-    usage.mark_seeded()
 
 
 def check_milestones(snap: dict, usage: UsageStore, subs: SubscriberStore, names: NameStore = None) -> bool:
@@ -1303,23 +1428,26 @@ def cmd_refresh(usage: UsageStore, subs: SubscriberStore, names: NameStore = Non
         premium_exceeded = total_premium >= PREMIUM_TOKEN_HARD_CAP
 
         if normal_exceeded or premium_exceeded:
-            activity = _fetch_recent_activity(minutes=OVERCAP_WINDOW_MINS)
-            active   = {pid: c for pid, c in activity.items() if c > 0}
-            if active:
-                usage.update_last_illegal_seen()
-                if mode != "aggressive":
-                    usage.set_mode("aggressive")
-                if names:
-                    _broadcast_named(
-                        lambda n, a=active, ne=normal_exceeded, pe=premium_exceeded:
-                            fmt_overcap_active_alert(a, ne, pe, n),
-                        subs, names,
-                    )
-                else:
-                    _send_all(fmt_overcap_active_alert(active, normal_exceeded, premium_exceeded), subs)
-                mode_note = "\n🔴 <b>AGGRESSIVE mode active — illegal projects detected, broadcast sent.</b>"
+            banded = _fetch_recent_activity_by_band(minutes=OVERCAP_WINDOW_MINS)
+            if banded is None:
+                mode_note = "\n⚠️ Budget cap exceeded — activity API unreachable, can't verify."
             else:
-                mode_note = "\n⚠️ Budget cap exceeded — no active projects detected right now."
+                illegal = _filter_to_exceeded_band(banded, normal_exceeded, premium_exceeded)
+                if illegal:
+                    usage.update_last_illegal_seen()
+                    if mode != "aggressive":
+                        usage.set_mode("aggressive")
+                    if names:
+                        _broadcast_named(
+                            lambda n, r=illegal, ne=normal_exceeded, pe=premium_exceeded:
+                                fmt_overcap_active_alert(r, ne, pe, n),
+                            subs, names,
+                        )
+                    else:
+                        _send_all(fmt_overcap_active_alert(illegal, normal_exceeded, premium_exceeded), subs)
+                    mode_note = "\n🔴 <b>AGGRESSIVE mode active — projects burning the exhausted band, broadcast sent.</b>"
+                else:
+                    mode_note = "\n⚠️ Budget cap exceeded — no projects active on the exhausted band right now."
         elif new_milestone and mode == "passive":
             usage.set_mode("urgent")
             usage.set_last_milestone_ts(time.time())
@@ -1567,36 +1695,22 @@ def telegram_poll_loop(usage: UsageStore, subs: SubscriberStore,
 # ── Usage poll thread ──────────────────────────────────────────────────────
 
 def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore = None) -> None:
-    # Reset stale state from a previous day on startup
-    persisted_date = usage.get().get("date")
-    last_date      = today_str()
-    if persisted_date and persisted_date != last_date:
-        usage.reset_day()
-        print(f"[poll] Stale state from {persisted_date} — daily state reset on startup")
-
-    first_poll = True   # first poll of each day: seed milestones, never alert
+    """Day rollover is handled by UsageStore.update() (auto-detects date change) and by
+    the constructor's stale-date check. seed-vs-check is driven by has_seeded()."""
     fail_count = 0
 
     while True:
-        snap = None
         try:
-            current_date = today_str()
-            if current_date != last_date:
-                usage.reset_day()
-                last_date  = current_date
-                first_poll = True
-                print(f"[poll] New day {current_date} — daily state reset")
-
             snap = fetch_today_usage()
             if snap:
-                # Overlay costs; fall back to cache on failure
-                costs = _fetch_costs()
+                # Overlay costs; fall back to cache on failure.
+                costs    = _fetch_costs()
+                org_cost = 0.0
                 if costs:
                     org_cost = costs.pop("__org__", 0.0)
                     for pid, p in snap.get("projects", {}).items():
                         p["cost_usd"] = round(costs.get(pid, 0.0), 6)
                     snap["total_cost"] = round(sum(costs.values()) + org_cost, 6)
-                    usage.update_costs(costs, snap["total_cost"], org_cost)
                 else:
                     cached_costs = usage.get_costs_cache()
                     if cached_costs:
@@ -1605,32 +1719,34 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                             p["cost_usd"] = round(per_proj.get(pid, 0.0), 6)
                         snap["total_cost"] = cached_costs.get("total", 0.0)
 
-                usage.update(snap)
-                normal_tok  = snap.get("total_normal_tokens", 0)
+                usage.update(snap)   # auto-resets daily state on day rollover
+                if costs:
+                    usage.update_costs(costs, snap["total_cost"], org_cost)
+
+                normal_tok  = snap.get("total_normal_tokens",  0)
                 premium_tok = snap.get("total_premium_tokens", 0)
                 n_str    = _color(f"{_fmt_tokens(normal_tok)}/10M",  _tok_color(normal_tok,  TOKEN_HARD_CAP))
                 p_str    = _color(f"{_fmt_tokens(premium_tok)}/1M",  _tok_color(premium_tok, PREMIUM_TOKEN_HARD_CAP))
                 cost_str = f"  cost=${snap.get('total_cost', 0.0):.4f}" if snap.get("total_cost") else ""
-                print(f"[poll/{usage.get_mode()}] {current_date}  normal={n_str}  premium={p_str}{cost_str}")
+                print(f"[poll/{usage.get_mode()}] {snap.get('date')}  normal={n_str}  premium={p_str}{cost_str}")
 
-                # ── Milestone handling ──────────────────────────────────────
-                if first_poll:
+                # ── Milestone handling ─────────────────────────────────────
+                if not usage.has_seeded():
                     seed_milestones(snap, usage, subs, names)
-                    first_poll = False
-                    print("[poll] First poll of day — milestone status notified")
+                    print("[poll] Day seeded — milestone status notified")
                 else:
                     new_ms = check_milestones(snap, usage, subs, names)
                     mode   = usage.get_mode()
                     if new_ms and mode != "aggressive":
                         if mode == "urgent":
-                            usage.reset_urgent_step()  # new milestone → restart from 3 min
+                            usage.reset_urgent_step()   # new milestone → restart from 3 min
                         else:
                             usage.set_mode("urgent")
                             print("[mode] → URGENT (milestone crossed)")
                         usage.set_last_milestone_ts(time.time())
 
-                # ── Cap check (runs every poll regardless of mode) ──────────
-                normal_exceeded  = normal_tok >= TOKEN_HARD_CAP
+                # ── Cap check (runs every poll regardless of mode) ─────────
+                normal_exceeded  = normal_tok  >= TOKEN_HARD_CAP
                 premium_exceeded = premium_tok >= PREMIUM_TOKEN_HARD_CAP
 
                 if normal_exceeded or premium_exceeded:
@@ -1643,12 +1759,11 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                             usage.set_mode("passive")
                             print("[mode] → PASSIVE (1 h without new milestone)")
                     elif mode == "aggressive":
-                        # Caps cleared (day rolled over mid-aggressive), revert
+                        # Both caps cleared (likely day rollover handled by update())
                         usage.set_mode("passive")
                         print("[mode] → PASSIVE (caps no longer exceeded)")
 
                 fail_count = 0
-
             else:
                 fail_count += 1
                 mode     = usage.get_mode()
@@ -1658,12 +1773,11 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                 print(f"[poll] Fetch failed ({fail_count}) — retry in {backoff // 60:.0f} min (backoff)")
                 time.sleep(backoff)
                 continue
-
         except Exception as e:
             print(f"[poll loop error] {e}")
             fail_count += 1
 
-        # ── Determine next sleep interval ───────────────────────────────────
+        # ── Determine next sleep interval ──────────────────────────────────
         mode = usage.get_mode()
         if mode == "passive":
             sleep_secs = PASSIVE_INTERVAL_SECS
@@ -1678,23 +1792,27 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
 # ── Concurrency check thread ───────────────────────────────────────────────
 
 def concurrency_check_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore = None) -> None:
-    """Every CONCURRENCY_WINDOW_MINS minutes, check for simultaneous project activity."""
+    """Every CONCURRENCY_WINDOW_MINS minutes, check for simultaneous project activity.
+    On API failure, leaves the previous active_projects snapshot intact rather than
+    overwriting it with an empty dict (which would falsely report 'no activity')."""
     while True:
         try:
             activity = _fetch_recent_activity(CONCURRENCY_WINDOW_MINS)
-            active   = {pid: count for pid, count in activity.items() if count > 0}
-            usage.set_active_projects(active, CONCURRENCY_WINDOW_MINS)
+            if activity is None:
+                print("[concurrency] activity fetch failed — keeping last known snapshot")
+            else:
+                active = {pid: count for pid, count in activity.items() if count > 0}
+                usage.set_active_projects(active, CONCURRENCY_WINDOW_MINS)
 
-            if len(active) >= CONCURRENCY_THRESHOLD:
-                last_ts = usage.get_last_concurrent_alert_ts()
-                if last_ts is None or time.time() - last_ts > CONCURRENCY_COOLDOWN:
-                    usage.set_last_concurrent_alert_ts(time.time())
-                    if names:
-                        _broadcast_named(lambda n, a=active: fmt_concurrency_alert(a, n), subs, names)
-                    else:
-                        _send_all(fmt_concurrency_alert(active), subs)
-                    print(f"[concurrency] Alert fired — {len(active)} projects active")
-
+                if len(active) >= CONCURRENCY_THRESHOLD:
+                    last_ts = usage.get_last_concurrent_alert_ts()
+                    if last_ts is None or time.time() - last_ts > CONCURRENCY_COOLDOWN:
+                        usage.set_last_concurrent_alert_ts(time.time())
+                        if names:
+                            _broadcast_named(lambda n, a=active: fmt_concurrency_alert(a, n), subs, names)
+                        else:
+                            _send_all(fmt_concurrency_alert(active), subs)
+                        print(f"[concurrency] Alert fired — {len(active)} projects active")
         except Exception as e:
             print(f"[concurrency check error] {e}")
 
