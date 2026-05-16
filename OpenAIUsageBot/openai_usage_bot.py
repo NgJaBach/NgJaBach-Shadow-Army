@@ -66,13 +66,6 @@ TOKEN_MILESTONES = [
     (10_000_000, "cap"),       # switches to spend-based alerting from here
 ]
 TOKEN_HARD_CAP       = 10_000_000
-SPEND_ALERT_INTERVAL = 2.00        # alert every $2 of daily spend after cap
-
-# OpenAI costs API has a ~5-minute ingestion delay (documented).
-# We lag end_time by 10 minutes as a safe buffer. If fewer than
-# COST_DATA_DELAY_SECS have elapsed since midnight, costs are skipped
-# (no data would exist yet anyway).
-COST_DATA_DELAY_SECS = 600  # 10 minutes
 
 # Premium models — 1M free daily (gpt-4o, gpt-4.1, o1, o3, etc.)
 PREMIUM_TOKEN_MILESTONES = [
@@ -953,45 +946,6 @@ def fmt_premium_token_milestone(threshold: int, current: int, level: str, name: 
     )
 
 
-def fmt_limit_alert(total_cost: float, name: str = "Bach") -> str:
-    return (
-        f"⚠️ <b>Daily Spend Limit Reached — ${total_cost:.4f}</b>\n\n"
-        f"Daily spend has reached the ${DAILY_LIMIT:.2f} limit.\n"
-        f"<i>Monarch {name}, your war chest requires attention.</i>"
-    )
-
-
-def fmt_post_limit_alert(total_cost: float, level: int, name: str = "Bach") -> str:
-    """Escalating drama for each $2 interval above the $5 daily limit."""
-    if level == 1:
-        return (
-            f"⚠️ <b>Expenditure Continues — ${total_cost:.4f} today</b>\n\n"
-            f"The ${DAILY_LIMIT:.0f} limit has been surpassed and spending persists.\n"
-            f"My Liege {name}, this warrants immediate review."
-        )
-    if level == 2:
-        return (
-            f"🚨 <b>Sustained Excess — ${total_cost:.4f} today</b>\n\n"
-            f"Your organization has now spent <b>${total_cost:.2f}</b> in a single day. "
-            f"This is ${total_cost - DAILY_LIMIT:.2f} beyond the sanctioned limit.\n"
-            f"Monarch {name} — your intervention is required."
-        )
-    if level == 3:
-        return (
-            f"‼️ <b>CRITICAL EXPENDITURE — ${total_cost:.4f} today</b>\n\n"
-            f"Three thresholds have been breached. The budget is uncontrolled.\n"
-            f"All active projects should be reviewed immediately.\n"
-            f"<b>{name} the Monarch — this cannot continue without acknowledgment.</b>"
-        )
-    return (
-        f"🔴 <b>UNRESTRAINED SPEND — ${total_cost:.4f} today</b>\n\n"
-        f"Your daily expenditure has reached <b>${total_cost:.2f}</b> — "
-        f"<b>${total_cost - DAILY_LIMIT:.2f} above the limit</b>.\n"
-        f"Budget integrity has collapsed. Halt all non-essential operations.\n\n"
-        f"<b>MONARCH {name.upper()}. THE LEDGER IS BLEEDING. YOUR COMMAND IS REQUIRED.</b>"
-    )
-
-
 def fmt_concurrency_alert(active: dict, name: str = "Bach") -> str:
     lines = [
         f"⚡ <b>Concurrent Project Activity — {len(active)} Projects</b>\n",
@@ -1020,7 +974,7 @@ def fmt_overcap_active_alert(active: dict, normal_exceeded: bool, premium_exceed
     ]
     for pid, count in sorted(active.items(), key=lambda x: x[1], reverse=True):
         proj_name = KNOWN_PROJECTS.get(pid, pid)
-        lines.append(f"🚨 <b>{proj_name}</b>  —  {count:,} requests in the last {CONCURRENCY_WINDOW_MINS} min")
+        lines.append(f"🚨 <b>{proj_name}</b>  —  {count:,} requests in the last {OVERCAP_WINDOW_MINS} min")
     lines.append(f"\n<b>HALT ALL NON-ESSENTIAL OPERATIONS IMMEDIATELY.</b>")
     lines.append(f"<i>(Activity window: last {OVERCAP_WINDOW_MINS} min — accounts for API ingestion lag)</i>")
     lines.append(f"<i>Monarch {name} — the treasury is bleeding. Your command is required at once.</i>")
@@ -1314,8 +1268,8 @@ def cmd_active(usage: UsageStore, name: str = "Bach") -> str:
         lines.append(f"No API activity detected in the last {window} minutes.")
     else:
         for pid, count in sorted(active.items(), key=lambda x: x[1], reverse=True):
-            name = KNOWN_PROJECTS.get(pid, pid)
-            lines.append(f"• <b>{name}</b>  —  {count:,} requests")
+            proj_name = KNOWN_PROJECTS.get(pid, pid)
+            lines.append(f"• <b>{proj_name}</b>  —  {count:,} requests")
 
         if len(active) >= CONCURRENCY_THRESHOLD:
             lines.append(f"\n⚠️ <b>{len(active)} projects active simultaneously.</b>")
